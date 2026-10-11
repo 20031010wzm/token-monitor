@@ -600,6 +600,18 @@ function emptySession(client, id) {
 const sessionsWithLiveSource = new WeakSet();
 
 function mergeSession(target, source) {
+  const sourceArchived = source.archived === true || source.deleted === true || source.sourceDeleted === true;
+  const sourceLive = !sourceArchived && source.retained !== true;
+  const targetHasLiveSource = sessionsWithLiveSource.has(target);
+  // Historical transcript fields cannot describe a live copy's current turn.
+  // Native observations have their own clock and can accompany retained usage.
+  if (sourceLive && !targetHasLiveSource) {
+    target.lastUsedAt = '';
+    target.contextTokens = 0;
+    target.contextWindow = 0;
+    for (const field of ['turnEnded', 'waitingForInput', 'promptCache']) delete target[field];
+  }
+  const useSourceActivity = sourceLive || !targetHasLiveSource;
   const sourceTokens = Math.max(0, Math.round(asNumber(source.totalTokens)));
   target.totalTokens += sourceTokens;
   target.costUsd += asNumber(source.costUsd);
@@ -617,8 +629,8 @@ function mergeSession(target, source) {
   if (sourceStarted && (!targetStarted || sourceStarted < targetStarted)) target.startedAt = new Date(sourceStarted).toISOString();
   const sourceLastUsed = timestampMs(source.lastUsedAt);
   const targetLastUsed = timestampMs(target.lastUsedAt);
-  if (sourceLastUsed && sourceLastUsed > targetLastUsed) target.lastUsedAt = new Date(sourceLastUsed).toISOString();
-  if (hasOwn(source, 'promptCache') && sourceLastUsed >= targetLastUsed) {
+  if (useSourceActivity && sourceLastUsed && sourceLastUsed > targetLastUsed) target.lastUsedAt = new Date(sourceLastUsed).toISOString();
+  if (useSourceActivity && hasOwn(source, 'promptCache') && sourceLastUsed >= targetLastUsed) {
     target.promptCache = normalizePromptCache(source.promptCache);
   }
   const sourceProjectId = String(source.projectId || '');
@@ -642,7 +654,7 @@ function mergeSession(target, source) {
   // and a target that has no reading at all takes the source's: absent means
   // this device never read a transcript, not that the reading is empty.
   const sourceContextWindow = Math.max(0, Math.round(asNumber(source.contextWindow)));
-  if (sourceContextWindow > 0) {
+  if (useSourceActivity && sourceContextWindow > 0) {
     const targetContextWindow = Math.max(0, Math.round(asNumber(target.contextWindow)));
     if (targetContextWindow <= 0 || sourceLastUsed >= targetLastUsed) {
       target.contextWindow = sourceContextWindow;
@@ -653,7 +665,7 @@ function mergeSession(target, source) {
   // same session can appear in several periods, and a turn that started after
   // one of them was decorated has to be able to clear it. Absent means "this
   // client reports no boundary", which never overwrites a real reading.
-  if (hasOwn(source, 'turnEnded')) {
+  if (useSourceActivity && hasOwn(source, 'turnEnded')) {
     const sourceEnded = source.turnEnded === true;
     // Strictly newer wins. At the same timestamp a positive claim beats a
     // negative one: both readings describe the same bytes, and one of them
@@ -665,7 +677,7 @@ function mergeSession(target, source) {
   }
   // Question state follows transcript activity. At equal timestamps a cleared
   // request wins, preventing an older period from resurrecting an answered call.
-  if (source.client === 'codex' && typeof source.waitingForInput === 'boolean') {
+  if (useSourceActivity && source.client === 'codex' && typeof source.waitingForInput === 'boolean') {
     if (sourceLastUsed > targetLastUsed || (sourceLastUsed === targetLastUsed
       && (target.waitingForInput !== false || source.waitingForInput === false))) {
       target.waitingForInput = source.waitingForInput;
@@ -673,8 +685,10 @@ function mergeSession(target, source) {
   }
   // Registry observations have their own clock: waiting can change without a
   // token or transcript write. An explicit unknown reading clears old evidence.
-  if (isSessionActivityClient(source.client)) {
+  if (!sourceArchived && isSessionActivityClient(source.client)) {
     const reading = normalizeLiveActivity(source.liveActivity);
+    // Native observations, including revocations, compete by their own clock
+    // even when their accounting contribution is retained.
     if (reading && canReplaceLiveActivity(target.liveActivity, reading)) {
       target.liveActivity = reading;
     }
@@ -701,9 +715,16 @@ function mergeSession(target, source) {
     const key = normalizeProviderName(provider);
     if (key) target.providers[key] = (target.providers[key] || 0) + Math.max(0, Math.round(asNumber(tokens)));
   }
-  const sourceArchived = source.archived === true || source.deleted === true || source.sourceDeleted === true;
+  if (source.retained === true && !targetHasLiveSource) {
+    target.retained = true;
+    target.sourceState = source.sourceState === 'missing' ? 'missing' : 'unknown';
+  } else if (sourceLive || (source.retained !== true && !targetHasLiveSource)) {
+    delete target.retained;
+    if (source.sourceState) target.sourceState = source.sourceState;
+    else delete target.sourceState;
+  }
   if (!sourceArchived) {
-    sessionsWithLiveSource.add(target);
+    if (sourceLive) sessionsWithLiveSource.add(target);
     delete target.archived;
   } else if (!sessionsWithLiveSource.has(target)) {
     target.archived = true;
@@ -820,6 +841,8 @@ function normalizeSession(input, fallbackKey) {
     }
   }
   if (input.archived === true || input.deleted === true || input.sourceDeleted === true) session.archived = true;
+  if (input.retained === true) session.retained = true;
+  if (['present', 'missing', 'unknown'].includes(input.sourceState)) session.sourceState = input.sourceState;
   return session;
 }
 

@@ -112,6 +112,7 @@
   function sessionActivityState(session, now = Date.now()) {
     if (isArchivedSession(session)) return 'idle';
     if (liveActivityExpiryAt(session, now)) return session.liveActivity.state;
+    if (session?.retained === true && session.sourceState === 'unknown') return 'idle';
     const last = timestampMs(session?.lastUsedAt);
     if (!last) return 'idle';
     const recent = nowMs(now) - last <= RUNNING_WINDOW_MS;

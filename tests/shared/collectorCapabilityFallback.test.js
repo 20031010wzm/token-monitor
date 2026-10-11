@@ -377,3 +377,79 @@ test('an upstream binary that rejects fork-only ids drops them like any unsuppor
   const calls = await collectWithFallback('claude,amp,proma,qodercn', false);
   assert.deepEqual(calls, ['claude,amp,proma,qodercn', 'claude', 'claude', 'claude']);
 });
+
+test('an upstream graph retries an unknown source-snapshots flag once and caches the fallback', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    return args.includes('--source-snapshots')
+      ? exitChild(2, "error: unexpected argument '--source-snapshots' found")
+      : jsonChild({ contributions: [{ date: '2026-10-11', clients: [{ client: 'claude', tokens: { input: 10 } }] }] });
+  };
+  try {
+    const { collectHistoryOnce, resetTokscaleCapabilityCache } = freshCollector();
+    const options = { clients: 'claude', todayKey: '2026-10-11', dailyHistoryArchiveEnabled: true,
+      dailyHistoryArchiveWriteEnabled: false, dailyHistoryArchiveOptions: { readJson: () => ({}) } };
+    for (let i = 0; i < 2; i++) assert.equal((await collectHistoryOnce(options)).summary.totalTokens, 10);
+    assert.deepEqual(calls.map(args => args.includes('--source-snapshots')), [true, false, false]);
+    assert.ok(calls.every(args => !args.includes('--help')));
+    resetTokscaleCapabilityCache();
+    await collectHistoryOnce(options);
+    assert.deepEqual(calls.map(args => args.includes('--source-snapshots')), [true, false, false, true, false]);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('source-snapshots fallback composes with an unknown-client retry', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    if (args.includes('--help')) return helpChild(['claude']);
+    if (isForkOnlyProbe(args)) return exitChild(2, "error: invalid value 'proma' for --client");
+    if (args.includes('--source-snapshots')) return exitChild(2, "error: unexpected argument '--source-snapshots' found");
+    if (args[args.indexOf('--client') + 1].includes('dsh')) return exitChild(2, "error: invalid value 'dsh' for --client");
+    return jsonChild({ contributions: [] });
+  };
+  try {
+    const { collectHistoryOnce } = freshCollector();
+    const options = { clients: 'claude,dsh', dailyHistoryArchiveEnabled: true,
+      dailyHistoryArchiveWriteEnabled: false, dailyHistoryArchiveOptions: { readJson: () => ({}) } };
+    await collectHistoryOnce(options);
+    await collectHistoryOnce(options);
+    const graphs = calls.filter(args => args.includes('graph'));
+    assert.deepEqual(graphs.map(args => args.includes('--source-snapshots')), [true, false, false, false]);
+    assert.deepEqual(graphs.map(args => args[args.indexOf('--client') + 1]), ['claude,dsh', 'claude,dsh', 'claude', 'claude']);
+    assert.equal(calls.filter(args => args.includes('--help')).length, 1);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('a graph error mentioning source-snapshots without an unknown argument does not retry', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    return exitChild(2, 'error: --source-snapshots failed to read source data');
+  };
+  try {
+    const { collectHistoryOnce } = freshCollector();
+    let status;
+    await collectHistoryOnce({ clients: 'claude', dailyHistoryArchiveEnabled: true,
+      dailyHistoryArchiveWriteEnabled: false, dailyHistoryArchiveOptions: { readJson: () => ({}) },
+      onHistoryStatus: value => { status = value; } });
+    assert.equal(calls.length, 1);
+    assert.equal(status.failureCode, 'history-graph-failed');
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});

@@ -25,6 +25,15 @@ const { normalizePeriod } = require('../../src/shared/usage');
 
 const { localDate } = require('../helpers/localTime');
 
+// Omission without owned filesystem evidence is retention, not deletion.
+function assertRetained(session) {
+  assert.equal(session.archived, undefined);
+  assert.equal(session.retained, true);
+  assert.equal(session.sourceState, 'unknown');
+  assert.equal(session.liveActivity, undefined);
+  assert.equal(require('../../src/shared/sessionLive').sessionActivityState(session), 'idle');
+}
+
 function liveSummary() {
   return {
     deviceId: 'macbook',
@@ -206,14 +215,14 @@ test('captures and reapplies missing sessions for any client without double-coun
   assert.equal(visible.today.unclassifiedTokens, 10);
   assert.equal(visible.today.clientUnclassifiedTokens.opencode, 10);
   assert.equal(visible.today.modelUnclassifiedTokens['claude-3-5-sonnet'], 10);
-  assert.equal(visible.today.sessions['opencode:o1'].archived, true);
+  assertRetained(visible.today.sessions['opencode:o1']);
   assert.equal(visible.today.sessions['opencode:o1'].totalTokens, 100);
   assert.equal(visible.today.sessions['codex:c1'].archived, undefined);
   assert.equal(visible.today.clients.codex, 50);
   assert.equal(visible.today.totalTokens, visible.today.clients.opencode + visible.today.clients.codex);
 
-  assert.equal(visible.month.sessions['opencode:o1'].archived, true);
-  assert.equal(visible.allTime.sessions['opencode:o1'].archived, true);
+  assertRetained(visible.month.sessions['opencode:o1']);
+  assertRetained(visible.allTime.sessions['opencode:o1']);
 });
 
 test('archive day and month windows expire while all-time stays available', () => {
@@ -228,7 +237,7 @@ test('archive day and month windows expire while all-time stays available', () =
 
   assert.equal(nextMonth.today.sessions['opencode:o1'], undefined);
   assert.equal(nextMonth.month.sessions['opencode:o1'], undefined);
-  assert.equal(nextMonth.allTime.sessions['opencode:o1'].archived, true);
+  assertRetained(nextMonth.allTime.sessions['opencode:o1']);
   assert.equal(nextMonth.allTime.clients.opencode, 100);
 });
 
@@ -247,7 +256,7 @@ test('uses the collector snapshot time when delivery crosses a period boundary',
   assert.equal(archiveDate.toISOString(), collectedAt.toISOString());
   assert.equal(nextPeriod.today.sessions['opencode:o1'], undefined);
   assert.equal(nextPeriod.month.sessions['opencode:o1'], undefined);
-  assert.equal(nextPeriod.allTime.sessions['opencode:o1'].archived, true);
+  assertRetained(nextPeriod.allTime.sessions['opencode:o1']);
 });
 
 test('month refresh does not make an old today session apply to a new day', () => {
@@ -466,7 +475,7 @@ test('canonical summary apply can reuse the caller-owned normalized record', () 
   });
 
   assert.equal(visible, summary);
-  assert.equal(visible.allTime.sessions['opencode:o1'].archived, true);
+  assertRetained(visible.allTime.sessions['opencode:o1']);
 });
 
 test('persists archive data outside settings via injectable storage helpers', () => {
@@ -594,7 +603,7 @@ test('reapplying an archive never invents a period the preview omitted', () => {
   const visible = applySessionUsageArchive(preview, archive, { now: new Date('2026-07-09T08:20:00.000Z') });
   assert.equal('month' in visible, false);
   assert.equal('allTime' in visible, false);
-  assert.equal(visible.today.sessions['opencode:o1'].archived, true);
+  assertRetained(visible.today.sessions['opencode:o1']);
 });
 
 // A client identity split (clientIdentitySplits.js) reverses a merge. A session
@@ -785,7 +794,7 @@ test('linked legacy Cursor events stay skipped once their session only survives 
   const visible = applySessionUsageArchive(cursorSummary([]), archive, { now: NOW });
 
   assert.equal(visible.allTime.totalTokens, 1000);
-  assert.equal(visible.allTime.sessions[`cursor:${CURSOR_UUID}`].archived, true);
+  assertRetained(visible.allTime.sessions[`cursor:${CURSOR_UUID}`]);
 });
 
 test('linked legacy Cursor events replay when their session is nowhere to be found', () => {
@@ -794,7 +803,7 @@ test('linked legacy Cursor events replay when their session is nowhere to be fou
   const visible = applySessionUsageArchive(cursorSummary([]), archive, { now: NOW });
 
   assert.equal(visible.allTime.totalTokens, 1000);
-  assert.equal(visible.allTime.sessions['cursor:cursor-active-2026-08-13T02:10:00.000Z'].archived, true);
+  assertRetained(visible.allTime.sessions['cursor:cursor-active-2026-08-13T02:10:00.000Z']);
 });
 
 for (const [name, events] of [
@@ -810,7 +819,7 @@ for (const [name, events] of [
     assert.equal(archive.sessions[key].supersededBy, undefined);
 
     const visible = applySessionUsageArchive(cursorSummary([cursorSession(CURSOR_UUID, 1000)]), archive, { now: NOW });
-    assert.equal(visible.allTime.sessions[key].archived, true);
+    assertRetained(visible.allTime.sessions[key]);
   });
 }
 
@@ -950,5 +959,5 @@ test('still preserves Cursor conversation sessions after the live source drops t
 
   assert.equal(visible.allTime.totalTokens, 1000);
   assert.equal(visible.allTime.clients.cursor, 1000);
-  assert.equal(visible.allTime.sessions[`cursor:${CURSOR_UUID}`].archived, true);
+  assertRetained(visible.allTime.sessions[`cursor:${CURSOR_UUID}`]);
 });

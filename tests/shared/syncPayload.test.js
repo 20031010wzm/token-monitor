@@ -10,6 +10,34 @@ test('syncPayload preserves nullish inputs', () => {
   assert.equal(syncPayload(undefined), undefined);
 });
 
+test('raw disabled-archive serialization and agent upload scrub the local source envelope', async () => {
+  const sourcePath = '/private/source/session.jsonl';
+  const raw = { deviceId: 'agent', sessionUsageArchiveEnabled: false,
+    sessionArchiveSource: { fullScan: true, presentKeys: ['codex:s'], managedKeys: ['codex:s'], paths: { 'codex:s': sourcePath } },
+    today: { totalTokens: 7, sessions: { 'codex:s': { client: 'codex', sessionId: 's', totalTokens: 7 } } },
+    allTime: { totalTokens: 7, projects: { app: { totalTokens: 7 } } }
+  };
+  const before = structuredClone(raw);
+  for (const options of [{}, { omitAllTimeProjects: true }, { maxBytes: 1 }]) {
+    const serialized = serializeSyncPayload(raw, options);
+    assert.equal(serialized.payload.sessionArchiveSource, undefined);
+    assert.equal(serialized.body.includes(sourcePath), false);
+  }
+  const requests = [];
+  const sent = await postSyncPayload(async (_url, request) => {
+    requests.push(JSON.parse(request.body));
+    return { status: requests.length === 1 ? 413 : 200, arrayBuffer: async () => new ArrayBuffer(0) };
+  }, 'https://hub.invalid/api/ingest', { summary: raw });
+  assert.equal(sent.retried, true);
+  assert.equal(requests.length, 2);
+  for (const payload of requests) {
+    assert.equal(payload.sessionArchiveSource, undefined);
+    assert.equal(JSON.stringify(payload).includes(sourcePath), false);
+    assert.equal(payload.today.totalTokens, 7);
+  }
+  assert.deepEqual(raw, before);
+});
+
 test('oversized model timing detail is omitted before session detail without mutating the source', () => {
   const modelThroughput = Object.fromEntries(Array.from({ length: 13000 }, (_, i) => [
     `model-${i}-${'x'.repeat(20)}`, { timedTokens: 1, timedOutputTokens: 1, timedDurationMs: 1 }

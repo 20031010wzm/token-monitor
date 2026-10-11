@@ -37,6 +37,22 @@ test('an archived session is never running, whatever its timestamp says', () => 
   assert.equal(sessionLive.isRunningSession({ lastUsedAt: fresh }, now), true);
 });
 
+test('retained unknown usage accepts fresh native activity and otherwise stays idle', () => {
+  const now = Date.parse('2026-10-10T09:00:00.000Z');
+  const base = { client: 'codex', retained: true, sourceState: 'unknown', lastUsedAt: new Date(now - 1000).toISOString(),
+    turnEnded: false, waitingForInput: true };
+  for (const state of ['running', 'waiting', 'idle']) {
+    const fresh = { ...base, liveActivity: { state, observedAt: new Date(now - 1000).toISOString() } };
+    assert.equal(sessionLive.sessionActivityState(fresh, now), state);
+    assert.equal(sessionLive.sessionActivityState({ ...fresh, archived: true }, now), 'idle');
+  }
+  for (const liveActivity of [undefined,
+    { state: 'unknown', observedAt: new Date(now - 1000).toISOString() },
+    { state: 'running', observedAt: new Date(now - sessionLive.LIVE_ACTIVITY_TTL_MS).toISOString() },
+    { state: 'waiting', observedAt: new Date(now + 1).toISOString() }
+  ]) assert.equal(sessionLive.sessionActivityState({ ...base, liveActivity }, now), 'idle');
+});
+
 test('a context reading needs both halves, and both are published', () => {
   assert.deepEqual(
     sessionLive.sessionContextWindow({ contextTokens: 190_000, contextWindow: 200_000 }),

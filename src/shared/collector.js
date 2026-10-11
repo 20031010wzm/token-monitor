@@ -26,7 +26,6 @@ const {
   applyPeriodDelta,
   emptyPeriod,
   extractUsageBundleFromTokscale,
-  extractUsageFromTokscale,
   mergePeriods,
   normalizeClientName,
   UNATTRIBUTED_USAGE_CLIENT
@@ -36,7 +35,8 @@ const { createWatcherHost } = require('./watcherHost');
 const { createSessionActivityScheduler } = require('./sessionActivityScheduler');
 const { activityWatchSources, activityClientsForPath, activityWatchIgnored } = require('./sessionActivityWatch');
 const { localDayKey, parseGraphResult, normalizeHistory, mergeHistories } = require('./history');
-const { retainDailyHistory, retainLiveDailyHistory } = require('./dailyHistoryArchive');
+const { retainDailyHistory, retainLiveDailyHistory, sourceSnapshotsFromGraphs, readDailyHistoryArchive, graphFromDailyHistoryArchive } = require('./dailyHistoryArchive');
+const { applySourceDailyUsage } = require('./usage/sourceDailyUsage');
 const {
   createSubprocessTermination,
   terminationUnconfirmedError
@@ -428,6 +428,7 @@ function resetTokscaleCapabilityCache() {
   // Same category of state: what this binary identity was observed to support.
   // Leaving it behind would keep a replaced binary pinned to the fallback grouping.
   tokscaleWorkspaceGroupBySupport.clear();
+  tokscaleSourceSnapshotsSupport.clear();
 }
 
 // Exit code 2 alone is clap's generic "argument parsing failed" code, not a
@@ -446,6 +447,7 @@ const TOKSCALE_WORKSPACE_GROUP_BY = 'client,workspace,session,model';
 // property of the binary, not of the tick, so one scan pays for the discovery
 // and every later scan on the same binary starts with the grouping it accepts.
 const tokscaleWorkspaceGroupBySupport = new Map();
+const tokscaleSourceSnapshotsSupport = new Map();
 
 function workspaceGroupBySupported(identity) {
   return tokscaleWorkspaceGroupBySupport.get(identity) !== false;
@@ -456,6 +458,12 @@ function workspaceGroupBySupported(identity) {
 // one flag that varies by binary; anything else still surfaces as-is.
 function isUnknownTokscaleGroupByError(error) {
   return Boolean(error) && /invalid group-by value/i.test(error?.tokscaleStderr || '');
+}
+
+function isUnknownTokscaleSourceSnapshotsError(error) {
+  return error?.tokscaleExitCode === 2
+    && /(?:unexpected|unknown|unrecognized|unrecognised) (?:argument|option)/i.test(error.tokscaleStderr || '')
+    && /--source-snapshots\b/.test(error.tokscaleStderr || '');
 }
 
 function isUnknownTokscaleClientError(error) {
@@ -528,6 +536,28 @@ function runCursorAwareTokscale(clientFilter, operation, signal) {
   return includesCursor ? withCursorLifecycle(operation, { signal }) : operation();
 }
 
+// Preserve literal report lanes before usage normalization folds aliases into
+// a tracked client. Partial graph scope can then correct one lane while the
+// other lane keeps its native accounting. Unknown report layouts stay on the
+// conservative canonical-partition path.
+function rawTokscalePartitions(json, period) {
+  if (!Array.isArray(json?.entries) || json.entries.some(row => typeof row?.client !== 'string' || !row.client)) return null;
+  const rows = new Map();
+  for (const row of json.entries) {
+    if (!rows.has(row.client)) rows.set(row.client, []);
+    rows.get(row.client).push(row);
+  }
+  const partitions = Object.fromEntries([...rows].map(([client, entries]) => [client, extractUsageBundleFromTokscale({ entries }).period]));
+  const combined = mergePeriods(...Object.values(partitions));
+  if (!['totalTokens', 'costUsd', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'].every(field => Math.abs(combined[field] - period[field]) < 1e-9)) return null;
+  return partitions;
+}
+
+function rawPartitionPresence(partitions) {
+  if (!partitions) return null;
+  return Object.entries(partitions).flatMap(([client, period]) => Object.values(period.sessions || {}).map(row => `${client}:${row.sessionId}`));
+}
+
 function runTokscale({
   clients,
   flags,
@@ -592,23 +622,31 @@ function runTokscale({
   ), signal);
 }
 
-function runTokscaleGraph({ clients, commandTimeoutMs, signal, terminationOptions, onTerminationUnconfirmed, customScanPaths, homeDir }) {
+function runTokscaleGraph({ clients, commandTimeoutMs, signal, terminationOptions, onTerminationUnconfirmed, customScanPaths, homeDir, sourceSnapshots = false }) {
   throwIfAborted(signal);
   const command = tokscaleCommand({ customScanPaths, homeDir });
   const requested = tokscaleClientFilter(clients);
   if (!requested) return Promise.resolve({ contributions: [] });
   const clientFilter = applyKnownCapabilityFilter(requested, command.identity);
   if (!clientFilter) return Promise.resolve({ contributions: [] });
-  const runArgs = (filter) => ['graph', '--client', filter, '--no-spinner'];
+  const runArgs = (filter) => ['graph', '--client', filter, '--no-spinner',
+    ...(sourceSnapshots && tokscaleSourceSnapshotsSupport.get(command.identity) !== false ? ['--source-snapshots'] : [])];
   const subprocessOptions = {
     operation: 'tokscale graph',
     terminationOptions,
     onTerminationUnconfirmed
   };
+  const scan = (filter) => spawnTokscaleJson(runArgs(filter), commandTimeoutMs, command, signal, subprocessOptions).catch((error) => {
+    if (!sourceSnapshots || tokscaleSourceSnapshotsSupport.get(command.identity) === false
+      || !isUnknownTokscaleSourceSnapshotsError(error)) return Promise.reject(error);
+    tokscaleSourceSnapshotsSupport.set(command.identity, false);
+    throwIfAborted(signal);
+    return spawnTokscaleJson(runArgs(filter), commandTimeoutMs, command, signal, subprocessOptions);
+  });
   return runCursorAwareTokscale(clientFilter, () => (
-    spawnTokscaleJson(runArgs(clientFilter), commandTimeoutMs, command, signal, subprocessOptions).catch((error) => (
+    scan(clientFilter).catch((error) => (
       retryWithKnownCapabilities(error, requested, command, { contributions: [] }, (filtered) => (
-        spawnTokscaleJson(runArgs(filtered), commandTimeoutMs, command, signal, subprocessOptions)
+        scan(filtered)
       ), signal, {
         terminationOptions,
         onTerminationUnconfirmed
@@ -649,6 +687,10 @@ function computePeriodWindows(now = new Date()) {
     today: { key: localTodayKey(now), endsAt: startOfNextDay.toISOString() },
     month: { key: monthKey, endsAt: startOfNextMonth.toISOString() }
   };
+}
+
+function timezoneFingerprint(now = new Date()) {
+  return JSON.stringify([computePeriodWindows(now).timeZone || '', now.getTimezoneOffset()]);
 }
 
 // Copy freshly decorated identities/timestamps from `today` onto the same session
@@ -792,11 +834,13 @@ async function collectHistoryOnce(options) {
     try {
       const graphJson = await runGraph({
         clients,
+        sourceSnapshots: options.dailyHistoryArchiveEnabled === true,
         commandTimeoutMs: options.commandTimeoutMs || HISTORY_TIMEOUT_MS,
         signal: options.signal
       });
       throwIfAborted(options.signal);
       rawGraphs.push(graphJson);
+      options.onSourceUsage?.(graphJson.sourceUsage);
       liveHistory = normalizeHistory(parseGraphResult(graphJson), { capDays, todayKey });
     } catch (error) {
       if (options.signal?.aborted) throw abortReason(options.signal);
@@ -823,9 +867,11 @@ async function collectHistoryOnce(options) {
         customPricingActive: options.customPricingActive,
         todayKey,
         capDays,
+        sourcePaths: options.sourcePaths,
         writeEnabled: options.dailyHistoryArchiveWriteEnabled
       });
       const retained = normalizeHistory(parseGraphResult(retainedGraph), { capDays, todayKey });
+      options.onRetainedSourceUsage?.(retainedGraph.sourceUsage);
       const result = retained.daily.length || retained.monthly.length ? retained : null;
       reportStatus(failureCode === null);
       return withLocalHistory(result);
@@ -933,6 +979,10 @@ async function collectUsageOnce(options) {
   let allTime = emptyPeriod();
   let dailyHistoryLiveDays = options.dailyHistoryLiveDays;
   let todayPartitions = null;
+  const nativePartitions = {};
+  const nativeRawPartitions = {};
+  const nativeRawPresence = {};
+  const captureRawPartitions = Boolean(options.dailyHistoryArchiveEnabled);
   const anchor = options.todayOnlyAnchor;
   const anchorUsed = Boolean(
     anchor
@@ -956,7 +1006,7 @@ async function collectUsageOnce(options) {
   }
   const emitProgress = (periods) => {
     if (typeof options.onProgress !== 'function') return;
-    try { options.onProgress({ ...periods, updatedAt: new Date().toISOString() }); } catch (_) {}
+    try { options.onProgress({ ...periods, updatedAt: collectedAt.toISOString() }); } catch (_) {}
   };
   if (normalizedClients) {
     const syncClients = targetRequested ? targetClientsCsv : normalizedClients;
@@ -986,12 +1036,14 @@ async function collectUsageOnce(options) {
       // windows exactly via applyPeriodDelta — one spawn instead of three.
       const scanClients = targetRequested ? targetClientsCsv : normalizedClients;
       let freshPartitions = Object.create(null);
+      let freshRawPresence = null;
       let useTargetedPartitions = targetRequested;
       if (scanClients) {
         const todayJson = await runTokscaleFn({ clients: scanClients, flags: ['--today'], commandTimeoutMs, signal: options.signal });
         throwIfAborted(options.signal);
         const bundle = extractUsageBundleFromTokscale(todayJson);
         freshPartitions = bundle.byClient;
+        if (captureRawPartitions) freshRawPresence = rawPartitionPresence(rawTokscalePartitions(todayJson, bundle.period));
         const unattributed = freshPartitions[UNATTRIBUTED_USAGE_CLIENT];
         const attributedClients = Object.keys(freshPartitions).filter((client) => client !== UNATTRIBUTED_USAGE_CLIENT);
         const hasMissingTargetPartition = (
@@ -1015,7 +1067,9 @@ async function collectUsageOnce(options) {
           // anchor partition. Rebuild the complete today snapshot instead.
           const fullTodayJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--today'], commandTimeoutMs, signal: options.signal });
           throwIfAborted(options.signal);
-          freshPartitions = extractUsageBundleFromTokscale(fullTodayJson).byClient;
+          const fullTodayBundle = extractUsageBundleFromTokscale(fullTodayJson);
+          freshPartitions = fullTodayBundle.byClient;
+          if (captureRawPartitions) freshRawPresence = rawPartitionPresence(rawTokscalePartitions(fullTodayJson, fullTodayBundle.period));
           useTargetedPartitions = false;
         } else if (targetRequested) {
           // Empty tokscale output uses the unattributed fallback shape. Keep the
@@ -1036,6 +1090,17 @@ async function collectUsageOnce(options) {
       }
       month = applyPeriodDelta(anchor.month, today, anchor.today);
       allTime = applyPeriodDelta(anchor.allTime, today, anchor.today);
+      if (freshRawPresence) {
+        const priorToday = anchor.todayRawPresence || anchor.nativeRawPresence?.today;
+        nativeRawPresence.today = useTargetedPartitions && priorToday
+          ? [...priorToday.filter(key => !targetClientSet.has(normalizeClientName(key.slice(0, key.indexOf(':'))))), ...freshRawPresence]
+          : useTargetedPartitions ? null : freshRawPresence;
+        if (nativeRawPresence.today) {
+          for (const name of ['month', 'allTime']) {
+            if (anchor.nativeRawPresence?.[name]) nativeRawPresence[name] = [...new Set([...anchor.nativeRawPresence[name], ...nativeRawPresence.today])];
+          }
+        }
+      }
     } else if (normalizedClients) {
       // Serial on purpose: concurrent scans triple the peak CPU/IO load, which
       // is what let the issue #15 self-trigger loop spike tokscale past 500% CPU.
@@ -1044,16 +1109,23 @@ async function collectUsageOnce(options) {
       const todayBundle = extractUsageBundleFromTokscale(todayJson);
       today = todayBundle.period;
       todayPartitions = todayBundle.byClient;
+      if (captureRawPartitions) nativeRawPartitions.today = rawTokscalePartitions(todayJson, today);
       if (typeof options.onProgress === 'function') decorateLocalPeriods({ today });
       emitProgress({ today });
       const monthJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--month'], commandTimeoutMs, signal: options.signal });
       throwIfAborted(options.signal);
-      month = extractUsageFromTokscale(monthJson);
+      const monthBundle = extractUsageBundleFromTokscale(monthJson);
+      month = monthBundle.period;
+      nativePartitions.month = monthBundle.byClient;
+      if (captureRawPartitions) nativeRawPartitions.month = rawTokscalePartitions(monthJson, month);
       if (typeof options.onProgress === 'function') decorateLocalPeriods({ today, month });
       emitProgress({ today, month });
       const allTimeJson = await runTokscaleFn({ clients: normalizedClients, flags: ['--since', allTimeSince], commandTimeoutMs, signal: options.signal });
       throwIfAborted(options.signal);
-      allTime = extractUsageFromTokscale(allTimeJson);
+      const allTimeBundle = extractUsageBundleFromTokscale(allTimeJson);
+      allTime = allTimeBundle.period;
+      nativePartitions.allTime = allTimeBundle.byClient;
+      if (captureRawPartitions) nativeRawPartitions.allTime = rawTokscalePartitions(allTimeJson, allTime);
     }
     // Always decorate: session timestamps drive the recency sort regardless of the
     // Projects opt-out (issue #182). decorateLocalPeriods gates only project identity
@@ -1072,9 +1144,13 @@ async function collectUsageOnce(options) {
       decorateLocalPeriods({ today, month, allTime }, { retryMisses: true });
     }
     todayPartitions = completeTodayPartitions(todayPartitions, normalizedClients);
+    nativePartitions.today = todayPartitions;
     // Partition metadata is internal but must remain as complete as the public
     // period: a later targeted tick re-merges these sessions into `today`.
     propagateTodayProjects(today, Object.values(todayPartitions), { ...localSessionMetadataDeps, projectsFromToday: true });
+  }
+  if (!anchorUsed && captureRawPartitions) {
+    for (const name of ['today', 'month', 'allTime']) nativeRawPresence[name] = rawPartitionPresence(nativeRawPartitions[name]);
   }
 
   // WSL contribution (Windows only; no-op elsewhere). Full tick scans running WSL
@@ -1105,7 +1181,7 @@ async function collectUsageOnce(options) {
       });
       wslBundle = wslResult.bundle;
       wslDetected = wslResult.detected;
-    } else if (options.wslAnchor) {
+    } else if (anchorUsed && options.wslAnchor) {
       wslBundle = options.wslAnchor;
     } else if (!anchorUsed) {
       const wslResult = await collectWsl({
@@ -1135,6 +1211,7 @@ async function collectUsageOnce(options) {
     options.historyEnabled !== false
     && options.dailyHistoryArchiveEnabled
     && options.deferLiveHistoryCapture !== true
+    && periodHasUsage(today)
   ) {
     try {
       const retainedLive = retainLiveDailyHistory(today, {
@@ -1239,6 +1316,15 @@ async function collectUsageOnce(options) {
     month,
     allTime
   };
+  const sourcePaths = {};
+  for (const [key, metadata] of localSessionMetadataDeps.metadataCache) {
+    if (metadata.sourcePath) sourcePaths[key] = metadata.sourcePath;
+  }
+  summary.sessionArchiveSource = {
+    fullScan: !anchorUsed,
+    presentKeys: Object.keys(allTime.sessions || {}),
+    paths: sourcePaths
+  };
   // The request ledger is this source's archive. A second per-session archive
   // would resurrect its contribution after a native rollout takes precedence.
   if (codexLocalView) summary.codexLocalSessionKeys = codexLocalView.sessionKeys;
@@ -1283,6 +1369,7 @@ async function collectUsageOnce(options) {
     options.onAnchorComputed({
       windowsPeriods,
       todayPartitions,
+      nativeRawPresence,
       t3Titles,
       catalogTitleSources,
       catalogProjects,
@@ -1296,6 +1383,9 @@ async function collectUsageOnce(options) {
     summary.history = null;
   } else if (options.includeHistory) {
     throwIfAborted(options.signal);
+    let capturedSourceUsage = null;
+    let capturedSourceClients = new Set();
+    let capturedSourceSnapshots = new Map();
     const history = await collectHistoryOnce({
       clients: normalizedClients,
       codexLocalGraph: codexLocalView?.graph || null,
@@ -1309,6 +1399,42 @@ async function collectUsageOnce(options) {
       dailyHistoryArchiveWriteEnabled: options.dailyHistoryArchiveWriteEnabled,
       dailyHistoryArchiveOptions: options.dailyHistoryArchiveOptions,
       dailyHistoryLiveDays,
+      sourcePaths,
+      onSourceUsage: (sourceUsage) => {
+        capturedSourceUsage = sourceUsage?.version === 1 && sourceUsage.fullHistory === true && sourceUsage.eventIdentityVersion === 1
+          && sourceUsage.bucketTimezone === summary.periodWindows.timeZone && sourceUsage.dayKey === localTodayKey(collectedAt)
+          ? sourceUsage : null;
+        capturedSourceSnapshots = sourceSnapshotsFromGraphs({ sourceUsage: capturedSourceUsage });
+        capturedSourceClients = new Set(capturedSourceUsage?.replacementClients || []);
+        for (const row of capturedSourceSnapshots.values()) capturedSourceClients.add(row.client);
+      },
+      onRetainedSourceUsage: (sourceUsage) => {
+        options.onSourceArchiveComputed?.(sourceUsage || { version: 1, sessions: [] });
+        const sourceClients = Object.entries(sourceUsage?.sourceSnapshots || {})
+          .filter(([client, snapshot]) => capturedSourceClients.has(client) && snapshot.replacementAuthority === true
+            && snapshot.capturedAt === capturedSourceUsage?.capturedAt)
+          .map(([client]) => client);
+        const acceptedClients = new Set(sourceClients);
+        const presentKeys = new Set(summary.sessionArchiveSource.presentKeys);
+        for (const row of capturedSourceSnapshots.values()) {
+          if (!acceptedClients.has(row.client)) continue;
+          const canonicalKey = `${normalizeClientName(row.client)}:${row.sessionId}`;
+          if (!presentKeys.has(canonicalKey)) {
+            presentKeys.add(canonicalKey);
+            summary.sessionArchiveSource.presentKeys.push(canonicalKey);
+          }
+        }
+        applySourceDailyUsage(summary, sourceUsage, {
+          todayKey: localTodayKey(collectedAt), allTimeSince,
+          replaceLive: !anchorUsed, sourceClients, nativePartitions, nativeRawPartitions, nativeRawPresence, nativePeriods: windowsPeriods,
+          nativeAnchor: anchorUsed ? anchor : null, clients: normalizedClients,
+          supplementalPeriods: Object.fromEntries(['today', 'month', 'allTime'].map(name => [name,
+            mergePeriods(wslBundle[name], codexLocalView?.[name] || emptyPeriod())]))
+        });
+        today = summary.today;
+        month = summary.month;
+        allTime = summary.allTime;
+      },
       pricingRevision: options.pricingRevision,
       customPricingActive: options.customPricingActive,
       onHistoryStatus: options.onHistoryStatus,
@@ -1316,6 +1442,20 @@ async function collectUsageOnce(options) {
     });
     throwIfAborted(options.signal);
     if (history) summary.history = history;
+  }
+  if (options.dailyHistoryArchiveEnabled && !options.includeHistory) {
+    try {
+      const sourceUsage = options.sourceArchiveSnapshot
+        || graphFromDailyHistoryArchive([], readDailyHistoryArchive(options.dailyHistoryArchiveOptions || {})).sourceUsage
+        || { version: 1, sessions: [] };
+      options.onSourceArchiveComputed?.(sourceUsage);
+      applySourceDailyUsage(summary, sourceUsage, {
+        todayKey: localTodayKey(collectedAt), allTimeSince, clients: normalizedClients,
+        nativePeriods: windowsPeriods, nativeRawPresence, nativeAnchor: anchorUsed ? anchor : null
+      });
+    } catch (error) {
+      options.logger?.(`daily source archive read failed: ${error.message}`);
+    }
   }
   // After history, so `lastActivityDay` can come from the daily buckets this
   // scan already produced rather than from a second source of truth.
@@ -2145,7 +2285,7 @@ function configFingerprint(clientsCsv, allTimeSince, projectsEnabled = true, qod
   // common case.
   const scanKey = customScanPathsFingerprint(customScanPaths);
   const scanPart = scanKey ? `|scan:${scanKey}` : '';
-  return `${normalizeClientsCsv(clientsCsv)}|${allTimeSince}|projects:${projectsEnabled !== false ? 'on' : 'off'}${qoderCnPart}${qoderCnProjectsPart}${scanPart}|pricing:${pricingRevision}`;
+  return `${normalizeClientsCsv(clientsCsv)}|${allTimeSince}|projects:${projectsEnabled !== false ? 'on' : 'off'}${qoderCnPart}${qoderCnProjectsPart}${scanPart}|pricing:${pricingRevision}|bucket:${timezoneFingerprint()}`;
 }
 
 function qoderCnSourcesForClients(clientsCsv, options = {}) {
@@ -2503,6 +2643,8 @@ function startCollector(options) {
   // anchor holds Windows-only periods; wslAnchor is the WSL contribution frozen
   // between full ticks (WSL is not scanned on watch ticks).
   let anchor = null;
+  let sourceArchiveSnapshot = null;
+  let timezoneRevision = timezoneFingerprint(collectionDate(options.now));
   let wslAnchor = null;
   let wslStatusAnchor = null;
   // The last-activity days a history refresh produced, carried across the ticks
@@ -2636,12 +2778,16 @@ function startCollector(options) {
         customScanPaths: options.customScanPaths,
         pricingRevision
       });
-      if (trust) {
+      // Older anchors collapsed raw source aliases into canonical session keys.
+      // Rebuild once before reusing them with source retention, so an omitted
+      // raw ID cannot be mistaken for a live sibling with the same session id.
+      if (trust && (!options.dailyHistoryArchiveEnabled || saved.nativeRawPresence)) {
         anchor = {
           dateKey: saved.dateKey,
           today: saved.today,
           month: saved.month,
           allTime: saved.allTime,
+          nativeRawPresence: saved.nativeRawPresence,
           t3Titles: saved.t3Titles,
           todayT3Titles: saved.todayT3Titles,
           catalogTitleSources: saved.catalogTitleSources,
@@ -2674,6 +2820,7 @@ function startCollector(options) {
         today: anchor.today,
         month: anchor.month,
         allTime: anchor.allTime,
+        nativeRawPresence: anchor.nativeRawPresence,
         t3Titles: anchor.t3Titles,
         todayT3Titles: anchor.todayT3Titles,
         catalogTitleSources: anchor.catalogTitleSources,
@@ -2729,7 +2876,9 @@ function startCollector(options) {
     const tickPricingRevision = pricingFingerprint(options);
     const sessionMetadataFallback = anchor;
     const pricingChanged = tickPricingRevision !== pricingRevision;
-    if (pricingChanged) {
+    const tickTimezoneRevision = timezoneFingerprint(collectedAt);
+    const timezoneChanged = tickTimezoneRevision !== timezoneRevision;
+    if (pricingChanged || timezoneChanged) {
       anchor = null;
       wslAnchor = null;
       wslStatusAnchor = null;
@@ -2737,6 +2886,7 @@ function startCollector(options) {
       lastFullScanAt = 0;
       lastHistoryAt = 0;
       pricingRevision = tickPricingRevision;
+      timezoneRevision = tickTimezoneRevision;
     }
     // The previous live DAY becomes durable history at local midnight. Finalize
     // it before publishing the new day, even when the normal History interval
@@ -2747,7 +2897,7 @@ function startCollector(options) {
       collectedAt.getTime(),
       lastHistoryAt,
       historyIntervalMs,
-      Boolean(tickOptions.forceHistory) || localDayRolledOver || pricingChanged,
+      Boolean(tickOptions.forceHistory) || localDayRolledOver || pricingChanged || timezoneChanged,
       historyEnabled
     );
     if (includeHistory) {
@@ -2757,7 +2907,8 @@ function startCollector(options) {
     let historyScanSucceeded = !includeHistory;
     const requestedTargetClients = [...new Set(normalizeClientsCsv(tickOptions.targetClients).split(',').filter(Boolean))];
     const targetAnchorReady = canTargetTodayPartitions(anchor, requestedTargetClients);
-    const anchored = Boolean(tickOptions.todayOnly && anchor && anchor.dateKey === todayKey);
+    const anchored = Boolean(tickOptions.todayOnly && anchor && anchor.dateKey === todayKey
+      && !(includeHistory && options.dailyHistoryArchiveEnabled));
     const refreshWsl = Boolean(tickOptions.refreshWsl);
     const hadPreviousFailure = tickHadFailure;
     lastTickAttemptAt = tickStartedAt;
@@ -2786,6 +2937,8 @@ function startCollector(options) {
         // liveDays overlay is passed into any graph scan that happens first.
         deferLiveHistoryCapture: true,
         dailyHistoryLiveDays: liveDailyHistoryDays,
+        sourceArchiveSnapshot,
+        onSourceArchiveComputed: snapshot => { sourceArchiveSnapshot = snapshot || sourceArchiveSnapshot; },
         onHistoryStatus: includeHistory ? (status) => {
           lastHistoryAttemptAt = Date.parse(status.attemptedAt) || lastHistoryAttemptAt;
           const successAt = Date.parse(status.successAt);
@@ -2893,7 +3046,8 @@ function startCollector(options) {
       }
       // A settings save can land between the serial period scans. Discard that
       // mixed result and replay all windows against one pricing revision.
-      if (pricingFingerprint(options) !== tickPricingRevision) {
+      if (pricingFingerprint(options) !== tickPricingRevision
+        || timezoneFingerprint(collectionDate(options.now)) !== tickTimezoneRevision) {
         return pricingChangedDuringScan;
       }
       if (includeHistory) {
@@ -2912,6 +3066,8 @@ function startCollector(options) {
           month: captured.windowsPeriods.month,
           allTime: captured.windowsPeriods.allTime,
           todayPartitions: captured.todayPartitions,
+          nativeRawPresence: captured.nativeRawPresence,
+          todayRawPresence: captured.nativeRawPresence?.today,
           t3Titles: captured.t3Titles,
           todayT3Titles: captured.t3Titles,
           catalogTitleSources: captured.catalogTitleSources,
@@ -2927,6 +3083,7 @@ function startCollector(options) {
         // Keep the rolling per-client today partitions fresh for targeted
         // watch ticks. WSL stays independently frozen between interval ticks.
         if (captured.todayPartitions) anchor.todayPartitions = captured.todayPartitions;
+        anchor.todayRawPresence = captured.nativeRawPresence?.today;
         const titlesChanged = JSON.stringify(anchor.todayT3Titles || anchor.t3Titles || {}) !== JSON.stringify(captured.t3Titles);
         const projectsChanged = JSON.stringify(anchor.catalogProjects || {}) !== JSON.stringify(captured.catalogProjects || {});
         const sourcesChanged = JSON.stringify(anchor.catalogTitleSources || {}) !== JSON.stringify(captured.catalogTitleSources || {});

@@ -113,6 +113,12 @@ test('same-day archived Claude resumes across the patch lane without losing usag
       sessions: { [key]: session('unknown', { liveActivity: undefined, costUsd: 1, models: { test: 100 } }) }
     }]));
     const retained = archive.captureSessionUsageArchive({}, original, new Date(now));
+    // The archive producer requires owned-source ENOENT evidence, not omission.
+    archive.updateSessionUsageArchive(retained, {
+      ...Object.fromEntries(['today', 'month', 'allTime'].map(name => [name, usage.emptyPeriod()])),
+      sessionArchiveSource: { fullScan: true, presentKeys: [],
+        paths: { [key]: path.join(f.home, 'deleted-transcript.jsonl') } }
+    }, new Date(now));
     const summary = archive.applySessionUsageArchive(Object.fromEntries(['today', 'month', 'allTime']
       .map(name => [name, usage.emptyPeriod()])), retained, { now: new Date(now) });
     assert.equal(summary.today.sessions[key].archived, true, 'use the actual archive producer');
@@ -338,7 +344,46 @@ test('historical archives omit transient activity and heartbeat updates do not r
   const restored = archive.applySessionUsageArchive({ today: usage.emptyPeriod() }, first.archive, { now });
   const retained = restored.today.sessions['claude:test-session'];
   assert.equal(live.sessionActivityState(retained, now), 'idle');
+  assert.equal(retained.archived, undefined);
+  assert.equal(retained.retained, true);
   assert.equal(retained.liveActivity, undefined);
+});
+
+test('native registry removal on retained accounting clears older peer activity in either wire order', async t => {
+  const f = fixture(t); f.write();
+  let clock = now;
+  t.mock.method(Date, 'now', () => clock);
+  const projection = require('../../src/shared/sessionActivityProjection');
+  const { serializeSyncPayload } = require('../../src/shared/syncPayload');
+  const key = 'claude:test-session';
+  const names = ['today', 'month', 'allTime'];
+  const original = Object.fromEntries(names.map(name => [name, usage.normalizePeriod({
+    totalTokens: 100, sessions: { [key]: session('unknown', { liveActivity: undefined }) }
+  })]));
+  const saved = archive.captureSessionUsageArchive({}, original, new Date(clock));
+  const retained = archive.applySessionUsageArchive(Object.fromEntries(names.map(name =>
+    [name, usage.emptyPeriod()])), saved, { now: new Date(clock) });
+  const waiting = activity.projectActivity(retained, await activity.readSummaryActivity(retained, f.options), clock);
+  assert.equal(live.sessionWithActivity(waiting.today, key).liveActivity.state, 'waiting');
+  fs.unlinkSync(path.join(f.root, '1234.json'));
+  clock += 1000;
+  const cleared = activity.projectActivity(waiting, await activity.readSummaryActivity(waiting,
+    { ...f.options, now: clock }), clock);
+  const materialized = projection.materializeActivity(cleared);
+  assert.equal(materialized.today.sessions[key].liveActivity.state, 'unknown');
+  const peer = Object.fromEntries(names.map(name => [name, usage.normalizePeriod({
+    totalTokens: 5, sessions: { [key]: session('waiting', { totalTokens: 5,
+      liveActivity: { state: 'waiting', observedAt: new Date(clock - 5000).toISOString() } }) }
+  })]));
+  const devices = [materialized, peer].map((value, index) => serializeSyncPayload({
+    ...value, deviceId: `registry-${index}`, updatedAt: new Date(clock).toISOString()
+  }).payload);
+  for (const ordered of [devices, [...devices].reverse()]) {
+    const merged = usage.aggregateDevices(ordered, 0, clock).periods.today.sessions[key];
+    assert.equal(merged.totalTokens, 105);
+    assert.deepEqual(merged.liveActivity, { state: 'unknown', observedAt: new Date(clock).toISOString() });
+    assert.equal(live.sessionActivityState(merged, clock), 'idle');
+  }
 });
 
 test('waiting survives normal row caps, is excluded from running counts and falls back on the shared expiry clock', () => {

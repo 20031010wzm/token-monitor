@@ -1,6 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
 const {
@@ -9,6 +12,7 @@ const {
   usageTransformSettings
 } = require('../../src/shared/usage/usageTransform');
 const { normalizePeriod } = require('../../src/shared/usage');
+const { createSessionUsageArchiveStore, readSessionUsageArchiveSnapshot } = require('../../src/shared/usage/sessionUsageArchiveStore');
 
 const AT = '2026-07-09T08:15:00.000Z';
 
@@ -87,6 +91,68 @@ test('a disabled session archive is neither captured nor read', () => {
   transform.transform(summary());
 
   assert.deepEqual(store.calls, []);
+});
+
+test('disabled archive projection strips local provenance without reading or capturing', () => {
+  const store = fakeStore();
+  const transform = createUsageTransform({ store, getSettings: () => ({ sessionUsageArchiveEnabled: false }) });
+  const raw = summary();
+  const sourcePath = path.join(os.tmpdir(), 'private-session.jsonl');
+  raw.sessionArchiveSource = { fullScan: true, presentKeys: ['codex:c1'], paths: { 'codex:c1': sourcePath } };
+  raw.today.sessions['codex:c1'].sourcePath = sourcePath;
+  const before = JSON.stringify(raw);
+
+  const visible = transform.transform(raw);
+
+  assert.equal(visible.sessionArchiveSource, undefined);
+  assert.equal(JSON.stringify(visible).includes(sourcePath), false);
+  assert.equal(visible.today.totalTokens, 100);
+  assert.deepEqual(store.calls, []);
+  assert.equal(JSON.stringify(raw), before);
+});
+
+test('a real archive store accepts final whole-ID correction after a preview at the same collection time', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-transform-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const options = { databasePath: path.join(directory, 'archive.sqlite'), path: path.join(directory, 'archive.json') };
+  const store = createSessionUsageArchiveStore(options);
+  t.after(() => store.close());
+  const transform = createUsageTransform({ store });
+  const initial = summary();
+  initial.updatedAt = new Date(Date.parse(AT) - 60_000).toISOString();
+  initial.sessionArchiveSource = { fullScan: true, presentKeys: ['codex:c1'] };
+  transform.transform(initial);
+
+  const preview = {
+    updatedAt: AT,
+    today: summary(80).today,
+    sessionArchiveSource: { fullScan: true, presentKeys: ['codex:c1'] }
+  };
+  assert.equal(transform.transform(preview).today.totalTokens, 80);
+  const final = summary(15);
+  final.today = normalizePeriod({});
+  final.month = normalizePeriod({});
+  final.sessionArchiveSource = { fullScan: true, presentKeys: ['codex:c1'] };
+  const visible = transform.transform(final);
+  assert.equal(visible.today.totalTokens, 0);
+  assert.equal(visible.month.totalTokens, 0);
+  assert.equal(visible.allTime.totalTokens, 15);
+
+  const zero = summary(0);
+  zero.today = normalizePeriod({});
+  zero.month = normalizePeriod({});
+  zero.allTime = normalizePeriod({});
+  zero.sessionArchiveSource = { fullScan: true, presentKeys: ['codex:c1'] };
+  transform.transform({ ...preview, updatedAt: new Date(Date.parse(AT) + 60_000).toISOString() });
+  zero.updatedAt = new Date(Date.parse(AT) + 60_000).toISOString();
+  const cleared = transform.transform(zero);
+  for (const name of ['today', 'month', 'allTime']) assert.equal(cleared[name].totalTokens, 0);
+  store.close();
+  const retained = readSessionUsageArchiveSnapshot(options).sessions['codex:c1'];
+  assert.equal(retained.periods.today, undefined);
+  assert.equal(retained.periods.month, undefined);
+  assert.equal(retained.periods.allTime.totalTokens, 0);
+  assert.equal(retained.periodWindows.today.capturedAt, zero.updatedAt);
 });
 
 test('a failed capture is reported and falls back to the loaded archive', () => {

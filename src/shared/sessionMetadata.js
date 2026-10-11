@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const os = require('node:os');
+const { ownedSessionSourcePath } = require('./usage/sessionSourceState');
 const { hashKey } = require('./hashKey');
 const { normalizeSessionContext } = require('./sessionContext');
 const claudeSessionMetadata = require('./providers/claude/sessionMetadata');
@@ -218,6 +219,9 @@ function fileSessionMetadata(sessionId, filePath, context, existing = {}) {
   const identity = resolveProjects ? projectIdentity(projectPathFromJsonl(filePath)) : {};
   return {
     ...existing,
+    // Resolver-owned provenance stays in the local metadata cache. The explicit
+    // applySessionMetadata projection below never copies it into usage rows.
+    ...(ownedSessionSourcePath(filePath) ? { sourcePath: filePath } : {}),
     startedAt,
     lastUsedAt,
     ...identity

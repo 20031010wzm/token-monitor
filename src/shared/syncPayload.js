@@ -192,6 +192,8 @@ function buildSyncPayload(summary, {
       .map((key) => [key, period[key]]));
   };
   const source = { ...summary, limits: syncLimits(summary.limits) };
+  // Collector provenance is local even when archive capture is disabled.
+  delete source.sessionArchiveSource;
   if (hasOwn(source, 'allTime')) source.allTime = withoutAllTimeSessions(source.allTime);
   if (source.periods && typeof source.periods === 'object' && hasOwn(source.periods, 'allTime')) {
     source.periods = { ...source.periods, allTime: withoutAllTimeSessions(source.periods.allTime) };

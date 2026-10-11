@@ -117,6 +117,12 @@ test('native Codex activity requires a verified metadata header before admitting
         sessions: { [f.key]: { ...original[name].sessions[f.key], costUsd: 1, turnEnded: true } }
       };
       const retained = archive.captureSessionUsageArchive({}, original, new Date(now));
+      // The archive producer requires owned-source ENOENT evidence, not omission.
+      archive.updateSessionUsageArchive(retained, {
+        ...Object.fromEntries(['today', 'month', 'allTime'].map(name => [name, usage.emptyPeriod()])),
+        sessionArchiveSource: { fullScan: true, presentKeys: [],
+          paths: { [f.key]: path.join(f.home, 'deleted-transcript.jsonl') } }
+      }, new Date(now));
       const summary = archive.applySessionUsageArchive(Object.fromEntries(['today', 'month', 'allTime']
         .map(name => [name, usage.emptyPeriod()])), retained, { now: new Date(now) });
       assert.equal(summary.today.sessions[f.key].archived, true);
@@ -264,6 +270,12 @@ test('same-day archived Codex question survives discovery and Sessions dedup wit
         sessions: { [f.key]: { ...original[name].sessions[f.key], costUsd: 1, models: { test: 100 } } } };
     }
     const retained = archive.captureSessionUsageArchive({}, original, new Date(now));
+    // The archive producer requires owned-source ENOENT evidence, not omission.
+    archive.updateSessionUsageArchive(retained, {
+      ...Object.fromEntries(['today', 'month', 'allTime'].map(name => [name, usage.emptyPeriod()])),
+      sessionArchiveSource: { fullScan: true, presentKeys: [],
+        paths: { [f.key]: path.join(f.home, 'deleted-transcript.jsonl') } }
+    }, new Date(now));
     const summary = archive.applySessionUsageArchive(Object.fromEntries(['today', 'month', 'allTime']
       .map(name => [name, usage.emptyPeriod()])), retained, { now: new Date(now) });
     assert.equal(summary.today.sessions[f.key].archived, true);

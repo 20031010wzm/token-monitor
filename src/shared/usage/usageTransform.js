@@ -4,6 +4,7 @@ const { applyArchivedClientUsage } = require('./clientUsageArchive');
 const {
   applySessionUsageArchive,
   normalizeSessionUsageArchive,
+  scrubSessionArchiveSource,
   sessionUsageArchiveDate
 } = require('./sessionUsageArchive');
 const { readSessionUsageArchiveSnapshot } = require('./sessionUsageArchiveStore');
@@ -93,7 +94,7 @@ function createUsageTransform(options = {}) {
       now
     });
     const visibleSummary = settings.sessionUsageArchiveEnabled === false
-      ? withArchivedClients
+      ? scrubSessionArchiveSource(withArchivedClients, { mutate: true })
       : applySessionUsageArchive(withArchivedClients, archive, {
           now,
           canonical: true,
