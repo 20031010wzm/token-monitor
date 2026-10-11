@@ -10,7 +10,7 @@ struct SessionsView: View {
 
     private var usage: UsagePeriod { store.displayPeriod(period) }
     private var sessions: [SessionListEntry] {
-        SessionListEntry.rows(usage.sessions ?? [:], query: query,
+        SessionListEntry.rows(usage.sessions ?? [:], activity: usage.sessionActivity, query: query,
                               grokBotIDs: SessionListEntry.grokBotIDs(store.stats?.periods ?? [:],
                                                                     authoritative: store.stats?.grokBotSessionIds))
     }
@@ -36,7 +36,9 @@ struct SessionsView: View {
                                     LazyVStack(alignment: .leading, spacing: DesignTokens.rowDividerSpacing) {
                                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, item in
                                             if index > 0 { Divider() }
-                                            if let session = item.session {
+                                            if item.isSessionGroup {
+                                                SessionGroupRow(entry: item, maximum: maximum, now: timeline.date)
+                                            } else if let session = item.session {
                                                 SessionRow(session: session, sessionKey: item.id,
                                                            maximum: maximum, now: timeline.date)
                                             } else {

@@ -41,7 +41,8 @@ struct BackgroundReviewGroupRow: View {
                     VStack(alignment: dynamicTypeSize.isAccessibilitySize ? .leading : .trailing, spacing: DesignTokens.rowLineSpacing) {
                         Text(MetricFormatter.exactTokens(entry.tokens ?? 0)).font(DesignTokens.rowValue)
                         if let cost = entry.cost {
-                            Text(MetricFormatter.usageCostFromUSD(cost, currency: preferences.currency))
+                            Text(MetricFormatter.compactUsageCost(cost, unpricedTokens: entry.unpricedTokens,
+                                                                  currency: preferences.currency))
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                         Image(systemName: expanded ? "chevron.up" : "chevron.down")

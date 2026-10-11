@@ -1,5 +1,43 @@
 import Foundation
 
+/// A collector's live reading of one session: provider-observed state plus the
+/// observation time. On the wire as `session.liveActivity` and in the period's
+/// `sessionActivity` overlay; mirrors `src/shared/sessionLive.js`.
+nonisolated struct LiveSessionActivity: Decodable, Sendable {
+    let state: String?
+    let observedAt: String?
+
+    static let validStates: Set<String> = ["running", "waiting", "idle", "unknown"]
+
+    var observedDate: Date? { Date.hubTimestamp(from: observedAt) }
+
+    /// The 30-second lease from `liveActivityExpiryAt`: reject future
+    /// observations and anything older than the lease; `unknown` never
+    /// overrides the transcript reading.
+    func expiryAt(now: Date) -> Date? {
+        guard let state, Self.validStates.contains(state), state != "unknown",
+              let observed = observedDate, observed <= now else { return nil }
+        let expiry = observed.addingTimeInterval(30)
+        return expiry > now ? expiry : nil
+    }
+
+    /// `canReplaceLiveActivity`: a valid, non-future observation that is at
+    /// least as new as the previous one (or the previous one is itself
+    /// future-dated and therefore untrusted).
+    func canReplace(_ previous: LiveSessionActivity?, now: Date) -> Bool {
+        guard let incoming = observedDate, incoming <= now else { return false }
+        guard let prior = previous?.observedDate else { return true }
+        return prior > now || incoming >= prior
+    }
+}
+
+/// The presentation states a session row can be in; mirrors
+/// `sessionActivityState` in `src/shared/sessionLive.js`. `ended` means the
+/// transcript reported the turn finished inside the activity window.
+nonisolated enum SessionActivityState: Sendable {
+    case running, waiting, ended, idle
+}
+
 /// Only the bounded, authenticated Hub summary is decoded. Transcripts stay on the collector.
 nonisolated struct SessionUsage: Decodable, Sendable {
     let client: String?
@@ -28,6 +66,13 @@ nonisolated struct SessionUsage: Decodable, Sendable {
     var sessionKind: String? = nil
     var promptCache: PromptCacheObservation? = nil
     var grokBotSession: Bool? = nil
+    var parentSessionId: String? = nil
+    var parentClient: String? = nil
+    var nativeSessionId: String? = nil
+    var t3ThreadId: String? = nil
+    var waitingForInput: Bool? = nil
+    var liveActivity: LiveSessionActivity? = nil
+    var unpricedTokens: Double? = nil
 
     func identityKey(fallback key: String) -> String {
         let id = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -45,7 +90,75 @@ nonisolated struct SessionUsage: Decodable, Sendable {
     }
 
     var isBackgroundReview: Bool { sessionKind?.trimmingCharacters(in: .whitespacesAndNewlines) == "background-review" }
-    func isRunning(at now: Date) -> Bool { isRecent(at: now) && turnEnded != true }
+
+    /// Clients whose collectors publish `sessionActivity` observations
+    /// (`SESSION_ACTIVITY_CLIENTS` in shared/sessionActivityProviders.js).
+    private static let activityClients: Set<String> = ["claude", "codex"]
+
+    /// The live observation that currently applies, if any. The period's
+    /// `sessionActivity` overlay is joined upstream by `UsagePeriod
+    /// .sessionWithActivity`; here only the merged `liveActivity` is read.
+    private func liveState(at now: Date) -> String? {
+        guard Self.activityClients.contains(client ?? ""), !isArchived,
+              liveActivity?.expiryAt(now: now) != nil else { return nil }
+        return liveActivity?.state
+    }
+
+    /// Mirrors `sessionActivityState`: archived sessions are idle; a live
+    /// provider observation inside its lease wins outright; otherwise the
+    /// transcript decides — recent without a turn end is running (or waiting
+    /// on a Codex question), a reported turn end is `ended`, and silence past
+    /// the window is idle.
+    func activityState(at now: Date) -> SessionActivityState {
+        guard !isArchived else { return .idle }
+        if let live = liveState(at: now) {
+            switch live {
+            case "running": return .running
+            case "waiting": return .waiting
+            case "idle": return .idle
+            default: break
+            }
+        }
+        guard isRecent(at: now) else { return .idle }
+        if turnEnded == true { return .ended }
+        if client == "codex", waitingForInput == true { return .waiting }
+        return .running
+    }
+
+    func isRunning(at now: Date) -> Bool { activityState(at: now) == .running }
+    func isWaiting(at now: Date) -> Bool { activityState(at: now) == .waiting }
+
+    /// A session with a verified `parentSessionId` that is not one of the
+    /// fixed aggregates — mirrors the `subagent` predicate in sessionRows.js.
+    /// `parentClient` defaults to the child's client, so a same-session or
+    /// self-link never counts.
+    var isSubagent: Bool { parentKey != nil }
+
+    /// `session:<parentClient>:<parentSessionId>` — the key the parent row
+    /// carries when it is visible in the same list, or nil for top-level
+    /// sessions and for the aggregates that keep their own groups.
+    var parentKey: String? {
+        let parentId = parentSessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !parentId.isEmpty, !isBackgroundReview else { return nil }
+        let parent = parentClient?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedClient = (parent?.isEmpty == false ? parent! : client) ?? ""
+        guard resolvedClient != client || parentId != (sessionId ?? "") else { return nil }
+        return "session:\(resolvedClient):\(parentId)"
+    }
+
+    /// The conversation identity `sessionConversationIdentity` groups by:
+    /// verified T3 thread, then the Codex native conversation UUID, then the
+    /// accounting key itself.
+    func conversationIdentity(key: String) -> String {
+        if let t3 = t3ThreadId?.trimmingCharacters(in: .whitespacesAndNewlines), !t3.isEmpty {
+            return "t3:\(t3)"
+        }
+        if client == "codex",
+           let native = nativeSessionId?.trimmingCharacters(in: .whitespacesAndNewlines), !native.isEmpty {
+            return "codex:\(native)"
+        }
+        return "session:\(key)"
+    }
 
     func cacheMinutesRemaining(at now: Date) -> Int? {
         guard !isArchived, client == "codex" || client == "claude", let promptCache,

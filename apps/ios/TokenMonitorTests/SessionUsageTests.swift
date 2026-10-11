@@ -193,4 +193,122 @@ struct SessionUsageTests {
         #expect(session.outputTokensPerSecond == 50)
         #expect(try decode(#"{"timedOutputTokens":200,"timedDurationMs":0}"#).outputTokensPerSecond == nil)
     }
+
+    // MARK: - Session groups (mirrors groupSubagentRows in sessionRows.js)
+
+    @Test func foldsSubagentsUnderTheirVisibleParentCountingUsageOnce() throws {
+        let now = try #require(Date.hubTimestamp(from: "2026-10-09T00:00:00Z"))
+        let sessions = [
+            "codex:parent": try decode(#"{"client":"codex","sessionId":"parent","totalTokens":100,"lastUsedAt":"2026-10-08T23:00:00Z"}"#),
+            "codex:child": try decode(#"{"client":"codex","sessionId":"child","parentSessionId":"parent","totalTokens":30,"lastUsedAt":"2026-10-08T23:30:00Z"}"#),
+            "claude:other": try decode(#"{"client":"claude","sessionId":"other","totalTokens":10,"lastUsedAt":"2026-10-08T22:00:00Z"}"#),
+        ]
+        let rows = SessionListEntry.rows(sessions, now: now)
+        #expect(rows.count == 2)
+        let group = try #require(rows.first { $0.isSessionGroup })
+        #expect(group.id == "session-group:subagents:codex:parent")
+        #expect(group.tokens == 130)
+        #expect(group.subagentCount == 1)
+        #expect(group.members.map(\.key) == ["codex:parent", "codex:child"])
+        #expect(group.members.map { $0.isMain } == [true, false])
+    }
+
+    @Test func keepsSubagentAsRowWhenItsParentIsOutsideTheList() throws {
+        let sessions = [
+            "codex:child": try decode(#"{"client":"codex","sessionId":"child","parentSessionId":"absent","totalTokens":30}"#),
+        ]
+        let rows = SessionListEntry.rows(sessions)
+        #expect(rows.count == 1)
+        #expect(rows[0].isSessionGroup == false)
+        #expect(rows[0].session?.isSubagent == true)
+        #expect(rows[0].session?.parentKey == "session:codex:absent")
+    }
+
+    @Test func foldsSameT3ConversationAsMainsNotSubagents() throws {
+        let now = try #require(Date.hubTimestamp(from: "2026-10-09T00:00:00Z"))
+        let sessions = [
+            "claude:a": try decode(#"{"client":"claude","sessionId":"a","t3ThreadId":"thread-1","totalTokens":40,"lastUsedAt":"2026-10-08T23:00:00Z"}"#),
+            "codex:b": try decode(#"{"client":"codex","sessionId":"b","t3ThreadId":"thread-1","totalTokens":60,"lastUsedAt":"2026-10-08T23:30:00Z"}"#),
+        ]
+        let rows = SessionListEntry.rows(sessions, now: now)
+        #expect(rows.count == 1)
+        let group = try #require(rows.first)
+        #expect(group.isSessionGroup)
+        #expect(group.subagentCount == 0)
+        #expect(group.tokens == 100)
+        #expect(group.members.allSatisfy { $0.isMain })
+    }
+
+    @Test func countsDistinctSubagentConversationsNotAccountingRows() throws {
+        let now = try #require(Date.hubTimestamp(from: "2026-10-09T00:00:00Z"))
+        let sessions = [
+            "codex:main": try decode(#"{"client":"codex","sessionId":"main","totalTokens":100,"lastUsedAt":"2026-10-08T23:00:00Z"}"#),
+            // Two rollouts of one delegated conversation share its native identity.
+            "codex:sub-a": try decode(#"{"client":"codex","sessionId":"sub-a","parentSessionId":"main","nativeSessionId":"11111111-2222-3333-4444-555555555555","totalTokens":10,"lastUsedAt":"2026-10-08T23:10:00Z"}"#),
+            "codex:sub-b": try decode(#"{"client":"codex","sessionId":"sub-b","parentSessionId":"main","nativeSessionId":"11111111-2222-3333-4444-555555555555","totalTokens":20,"lastUsedAt":"2026-10-08T23:20:00Z"}"#),
+            "codex:sub-c": try decode(#"{"client":"codex","sessionId":"sub-c","parentSessionId":"main","nativeSessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","totalTokens":5,"lastUsedAt":"2026-10-08T23:15:00Z"}"#),
+        ]
+        let group = try #require(SessionListEntry.rows(sessions, now: now).first)
+        #expect(group.isSessionGroup)
+        #expect(group.tokens == 135)
+        #expect(group.subagentCount == 2)
+        #expect(group.members.filter { $0.isMain }.map(\.key) == ["codex:main"])
+    }
+
+    @Test func backgroundReviewsKeepTheirOwnAggregate() throws {
+        let sessions = [
+            "codex:main": try decode(#"{"client":"codex","sessionId":"main","totalTokens":10}"#),
+            "codex:rev": try decode(#"{"client":"codex","sessionId":"rev","parentSessionId":"main","sessionKind":"background-review","totalTokens":5}"#),
+        ]
+        let rows = SessionListEntry.rows(sessions)
+        #expect(rows.count == 2)
+        #expect(rows.contains { $0.group == .codexAutoReview })
+        #expect(rows.contains { $0.id == "codex:main" && !$0.isSessionGroup })
+    }
+
+    // MARK: - Activity state (mirrors sessionActivityState in sessionLive.js)
+
+    @Test func activityStateFollowsLiveTranscriptAndWaitingRules() throws {
+        let now = try #require(Date.hubTimestamp(from: "2026-10-09T00:00:00Z"))
+        let recent = "2026-10-08T23:59:30Z"
+        #expect(try decode(#"{"client":"codex","lastUsedAt":"\#(recent)"}"#).activityState(at: now) == .running)
+        #expect(try decode(#"{"client":"codex","lastUsedAt":"\#(recent)","turnEnded":true}"#).activityState(at: now) == .ended)
+        #expect(try decode(#"{"client":"codex","lastUsedAt":"\#(recent)","waitingForInput":true}"#).activityState(at: now) == .waiting)
+        // waitingForInput is a Codex-only reading.
+        #expect(try decode(#"{"client":"claude","lastUsedAt":"\#(recent)","waitingForInput":true}"#).activityState(at: now) == .running)
+        #expect(try decode(#"{"client":"codex","lastUsedAt":"2026-10-08T23:40:00Z"}"#).activityState(at: now) == .idle)
+        #expect(try decode(#"{"client":"codex","lastUsedAt":"\#(recent)","archived":true}"#).activityState(at: now) == .idle)
+    }
+
+    @Test func liveActivityWinsInsideItsLeaseThenFallsBack() throws {
+        let now = try #require(Date.hubTimestamp(from: "2026-10-09T00:00:00Z"))
+        let live = #"{"client":"claude","lastUsedAt":"2026-10-08T23:50:00Z","liveActivity":{"state":"running","observedAt":"2026-10-08T23:59:50Z"}}"#
+        #expect(try decode(live).activityState(at: now) == .running)
+        // The lease is thirty seconds; an older observation falls back to the transcript.
+        #expect(try decode(live).activityState(at: now.addingTimeInterval(31)) == .idle)
+        let waiting = #"{"client":"claude","lastUsedAt":"2026-10-08T23:50:00Z","liveActivity":{"state":"waiting","observedAt":"2026-10-08T23:59:50Z"}}"#
+        #expect(try decode(waiting).activityState(at: now) == .waiting)
+        // Future and unknown observations never replace the transcript reading.
+        let future = #"{"client":"claude","lastUsedAt":"2026-10-08T23:59:30Z","liveActivity":{"state":"idle","observedAt":"2026-10-09T00:10:00Z"}}"#
+        #expect(try decode(future).activityState(at: now) == .running)
+        let unknown = #"{"client":"claude","lastUsedAt":"2026-10-08T23:59:30Z","liveActivity":{"state":"unknown","observedAt":"2026-10-08T23:59:50Z"}}"#
+        #expect(try decode(unknown).activityState(at: now) == .running)
+        // Non-activity clients never consume liveActivity.
+        let cursor = #"{"client":"cursor","lastUsedAt":"2026-10-08T23:49:59Z","liveActivity":{"state":"running","observedAt":"2026-10-08T23:59:50Z"}}"#
+        #expect(try decode(cursor).activityState(at: now) == .idle)
+    }
+
+    @Test func sessionActivityOverlayJoinsNewerObservations() throws {
+        let now = try #require(Date.hubTimestamp(from: "2026-10-09T00:00:00Z"))
+        let period = try JSONDecoder().decode(UsagePeriod.self, from: Data(#"""
+            {"sessions":{"claude:s1":{"client":"claude","sessionId":"s1","totalTokens":5,"lastUsedAt":"2026-10-08T23:50:00Z"},
+                         "cursor:c1":{"client":"cursor","sessionId":"c1","totalTokens":5,"lastUsedAt":"2026-10-08T23:59:30Z"}},
+             "sessionActivity":{"claude:s1":{"state":"running","observedAt":"2026-10-08T23:59:55Z"},
+                                "cursor:c1":{"state":"running","observedAt":"2026-10-08T23:59:55Z"}}}
+            """#.utf8))
+        let claude = try #require(period.sessions?["claude:s1"])
+        #expect(period.sessionWithActivity("claude:s1", claude, now: now).activityState(at: now) == .running)
+        let cursor = try #require(period.sessions?["cursor:c1"])
+        #expect(period.sessionWithActivity("cursor:c1", cursor, now: now).liveActivity == nil)
+    }
 }

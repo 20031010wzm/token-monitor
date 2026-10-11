@@ -5,13 +5,17 @@ import SwiftUI
 /// the Sessions tab.
 struct SessionsPreviewSection: View {
     let sessions: [String: SessionUsage]
+    var activity: [String: LiveSessionActivity]? = nil
+    var grokBotIDs: Set<String> = []
     let showAll: () -> Void
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { timeline in
             let now = timeline.date
-            let rows = SessionPreviewPresentation.rows(sessions, now: now)
-            let running = SessionPreviewPresentation.runningCount(sessions, at: now)
+            let rows = SessionPreviewPresentation.rows(
+                sessions, activity: activity, grokBotIDs: grokBotIDs, now: now)
+            let running = SessionPreviewPresentation.runningCount(
+                sessions, at: now, activity: activity, grokBotIDs: grokBotIDs)
             VStack(alignment: .leading, spacing: DesignTokens.headerToCardSpacing) {
                 SectionHeader("Sessions") {
                     HStack(alignment: .firstTextBaseline, spacing: 12) {
@@ -41,11 +45,11 @@ struct SessionsPreviewSection: View {
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     } else {
-                        let maximum = UsageRowPresentation.maximum(rows.map { $0.session.measuredTokens })
+                        let maximum = UsageRowPresentation.maximum(rows.map(\.tokens))
                         VStack(alignment: .leading, spacing: DesignTokens.rowDividerSpacing) {
                             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                                 if index > 0 { Divider() }
-                                SessionPreviewRow(session: row.session, maximum: maximum, now: now)
+                                SessionPreviewRow(entry: row, maximum: maximum, now: now)
                             }
                         }
                     }
@@ -57,11 +61,13 @@ struct SessionsPreviewSection: View {
 
 /// The compact session line: provider mark, title over tool·model·activity,
 /// a trailing token/status reading and the shared usage meter. SessionRow
-/// carries the full metadata on the Sessions tab.
+/// carries the full metadata on the Sessions tab. A folded group renders its
+/// header row — title, subagent count and summed tokens — without expansion.
 private struct SessionPreviewRow: View {
-    let session: SessionUsage
+    let entry: SessionListEntry
     let maximum: Double
     let now: Date
+    private var session: SessionUsage? { entry.session }
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .subheadline) private var markSize = 18.0
     @ScaledMetric(relativeTo: .subheadline) private var markInset = 26.0
@@ -73,7 +79,7 @@ private struct SessionPreviewRow: View {
                 : AnyLayout(HStackLayout(alignment: .top, spacing: 8))
             layout {
                 VStack(alignment: .leading, spacing: DesignTokens.rowLineSpacing) {
-                    Text(session.displayTitle ?? clientName)
+                    Text(session?.displayTitle ?? clientName)
                         .font(DesignTokens.rowTitle)
                         .lineLimit(1).truncationMode(.tail)
                     if !subtitle.isEmpty {
@@ -85,43 +91,54 @@ private struct SessionPreviewRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, markInset)
                 .overlay(alignment: .topLeading) {
-                    ProviderMark(provider: session.client, size: markSize)
+                    ProviderMark(provider: session?.client, size: markSize)
                         .overlay(alignment: .bottomTrailing) {
-                            if session.isRunning(at: now) {
+                            switch entry.activityState(at: now) {
+                            case .running:
                                 Circle().fill(.mint).frame(width: 5, height: 5)
                                     .overlay { Circle().stroke(.background, lineWidth: 1) }
                                     .accessibilityHidden(true)
+                            case .waiting:
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 7))
+                                    .foregroundStyle(.orange)
+                                    .accessibilityHidden(true)
+                            case .ended, .idle:
+                                EmptyView()
                             }
                         }
                 }
                 metrics
             }
-            UsageMeter(value: session.measuredTokens, maximum: maximum,
-                       color: ClientPresentation.color(for: session.client ?? "unknown"))
+            UsageMeter(value: entry.tokens, maximum: maximum,
+                       color: ClientPresentation.color(for: session?.client ?? "unknown"))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
     }
 
-    private var clientName: String { ClientPresentation.displayName(for: session.client ?? "unknown") }
+    private var clientName: String { ClientPresentation.displayName(for: session?.client ?? "unknown") }
 
     private var subtitle: String {
         var parts: [String] = []
-        if session.displayTitle != nil { parts.append(clientName) }
-        switch session.modelEntries.count {
+        if session?.displayTitle != nil { parts.append(clientName) }
+        switch session?.modelEntries.count ?? 0 {
         case 0: break
-        case 1: parts.append(session.modelEntries[0].id)
-        default: parts.append(String(localized: "\(session.modelEntries.count) models"))
+        case 1: parts.append(session?.modelEntries[0].id ?? "")
+        default: parts.append(String(localized: "\(session?.modelEntries.count ?? 0) models"))
         }
-        if session.isArchived { parts.append(String(localized: "Archived")) }
+        if session?.isArchived == true { parts.append(String(localized: "Archived")) }
         if let activity {
             parts.append(activity)
         }
-        return parts.joined(separator: " · ")
+        if entry.subagentCount > 0 {
+            parts.append(String(localized: "\(entry.subagentCount) subagents"))
+        }
+        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     private var activity: String? {
-        guard let date = session.lastActivity else { return nil }
+        guard let date = session?.lastActivity else { return nil }
         let time = Date.FormatStyle.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
             .locale(Locale(identifier: "en_US_POSIX"))
         return date.formatted(Calendar.current.isDate(date, inSameDayAs: now)
@@ -131,15 +148,22 @@ private struct SessionPreviewRow: View {
     private var metrics: some View {
         VStack(alignment: dynamicTypeSize.isAccessibilitySize ? .leading : .trailing,
                spacing: DesignTokens.rowLineSpacing) {
-            if let tokens = session.measuredTokens {
+            if let tokens = entry.tokens {
                 Text(MetricFormatter.exactTokens(tokens)).font(DesignTokens.rowValue)
             } else {
                 Text("Tokens unavailable").font(.footnote).foregroundStyle(.secondary)
             }
-            if session.isRunning(at: now) {
+            switch entry.activityState(at: now) {
+            case .running:
                 Text("Running").font(.caption2).foregroundStyle(.mint)
+            case .waiting:
+                Text("Waiting").font(.caption2).foregroundStyle(.orange)
+            case .ended, .idle:
+                EmptyView()
             }
-            SessionStatusView(session: session, now: now)
+            if let session {
+                SessionStatusView(session: session, now: now)
+            }
         }
         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
     }

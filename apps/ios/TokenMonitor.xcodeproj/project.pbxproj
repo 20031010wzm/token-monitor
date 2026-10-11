@@ -138,6 +138,7 @@
 		62658D3CB8FE131FC80391F7 /* UsageMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBCCCBB6EA32B2A704BDFBB8 /* UsageMeter.swift */; };
 		D50769BE706CF8C0639A5B23 /* DevicesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2086A9FF1E0C2FFE3891E207 /* DevicesView.swift */; };
 		CA93CA7100B5E7AB40897DFC /* SessionRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A0B9E476850644686225683 /* SessionRow.swift */; };
+		DCA300000000000000000010 /* SessionGroupRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA200000000000000000010 /* SessionGroupRow.swift */; };
 		E7086CE48545FD99F10464B6 /* ModelAliasSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DFA338A564582B393A71D1F /* ModelAliasSettings.swift */; };
 		E77FFC4DB2084F7F890A3C36 /* ModelAliasDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD5A7EAFABB248C2EFFD1CCA /* ModelAliasDocument.swift */; };
 		C41276EC57FBD4E34B6B449D /* PromptCacheObservation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EDEF8E189DF44A86741F303 /* PromptCacheObservation.swift */; };
@@ -337,6 +338,7 @@
 		DBCCCBB6EA32B2A704BDFBB8 /* UsageMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/DesignSystem/UsageMeter.swift"; sourceTree = SOURCE_ROOT; };
 		2086A9FF1E0C2FFE3891E207 /* DevicesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/Features/Overview/DevicesView.swift"; sourceTree = SOURCE_ROOT; };
 		5A0B9E476850644686225683 /* SessionRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/Features/Sessions/SessionRow.swift"; sourceTree = SOURCE_ROOT; };
+		DCA200000000000000000010 /* SessionGroupRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/Features/Sessions/SessionGroupRow.swift"; sourceTree = SOURCE_ROOT; };
 		7DFA338A564582B393A71D1F /* ModelAliasSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/Core/Models/ModelAliasSettings.swift"; sourceTree = SOURCE_ROOT; };
 		BD5A7EAFABB248C2EFFD1CCA /* ModelAliasDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/Core/Models/ModelAliasDocument.swift"; sourceTree = SOURCE_ROOT; };
 		9EDEF8E189DF44A86741F303 /* PromptCacheObservation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenMonitor/Core/Models/PromptCacheObservation.swift"; sourceTree = SOURCE_ROOT; };
@@ -666,6 +668,7 @@
 				DCA200000000000000000001 /* DesktopNavigation.LICENSE.txt */,
 				E2FB6FA957BF0C10BED4EF91 /* SystemSurfacesHint.swift */,
 				1FCD73906B9103A0E6567659 /* BackgroundReviewGroupRow.swift */,
+				DCA200000000000000000010 /* SessionGroupRow.swift */,
 				678AFAB952EF878C66E3E823 /* SessionStatusView.swift */,
 				EB9764CF2B94387551C10A9F /* SectionNavigationLink.swift */,
 				F972DB43B5C4EAA5BE8ABA46 /* SessionListEntry.swift */,
@@ -878,6 +881,7 @@
 				330D4472102067CA84EE6C9B /* SessionsPreviewSection.swift in Sources */,
 				2F3699A92D8F87D546AC9E30 /* SystemSurfacesHint.swift in Sources */,
 				6A7BB656501C6E66014BA6F7 /* BackgroundReviewGroupRow.swift in Sources */,
+				DCA300000000000000000010 /* SessionGroupRow.swift in Sources */,
 				CDEB662348E56C4660A79FEB /* SessionStatusView.swift in Sources */,
 				11ECF1ABF41F36286F771FC7 /* SectionNavigationLink.swift in Sources */,
 				5661717C97186CA0A3EA43DB /* SessionListEntry.swift in Sources */,

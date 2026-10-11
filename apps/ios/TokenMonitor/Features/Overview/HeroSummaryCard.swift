@@ -87,6 +87,7 @@ struct HeroSummaryCard: View {
     private var costReading: some View {
         Text(period.costUsd.map {
             MetricFormatter.currencyFromUSD($0, currency: preferences.currency)
+                + ((period.unpricedTokens ?? 0) > 0 ? " + ?" : "")
         } ?? "—")
             .font(.title3)
             .foregroundStyle(.secondary)

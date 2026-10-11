@@ -41,6 +41,17 @@ nonisolated enum MetricFormatter {
         return currency.symbol + amount.formatted(.number.precision(.fractionLength(digits)))
     }
 
+    /// The compact row label `compactUsageCostLabel` renders on the desktop:
+    /// known cost plus a marker when part of the usage has no catalog price —
+    /// the count itself stays out of the wire for display-only surfaces.
+    static func compactUsageCost(_ cost: Double?, unpricedTokens: Double, currency: AppCurrency) -> String {
+        let known = (cost?.isFinite == true) ? cost! : 0
+        guard unpricedTokens.isFinite, unpricedTokens > 0 else {
+            return usageCostFromUSD(known, currency: currency)
+        }
+        return known > 0 ? "\(usageCostFromUSD(known, currency: currency)) + ?" : "—"
+    }
+
     static func currency(
         _ value: Double,
         sourceCode: String,

@@ -34,7 +34,8 @@ struct BreakdownItem: View {
                     Text(showsCost ? MetricFormatter.exactTokens(entry.value) : MetricFormatter.tokens(entry.value))
                         .font(DesignTokens.rowValue)
                     if showsCost {
-                        Text(MetricFormatter.usageCostFromUSD(entry.cost, currency: preferences.currency))
+                        Text(MetricFormatter.compactUsageCost(entry.cost, unpricedTokens: entry.unpricedTokens,
+                                                              currency: preferences.currency))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     } else {

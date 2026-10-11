@@ -12,11 +12,15 @@ nonisolated struct UsagePeriod: Decodable, Sendable {
     var modelCosts: [String: Double]?
     var sessions: [String: SessionUsage]? = nil
     var sessionDetailsOmitted: Int? = nil
+    var sessionActivity: [String: LiveSessionActivity]? = nil
     var capabilities: Capabilities? = nil
     var unclassifiedTokens: Double? = nil
     var timedTokens: Double? = nil
     var timedOutputTokens: Double? = nil
     var timedDurationMs: Double? = nil
+    var unpricedTokens: Double? = nil
+    var clientUnpricedTokens: [String: Double]? = nil
+    var modelUnpricedTokens: [String: Double]? = nil
 
     struct Capabilities: Decodable, Sendable {
         let tokenComponents: Bool?
@@ -75,7 +79,8 @@ nonisolated struct UsagePeriod: Decodable, Sendable {
     var clientEntries: [BreakdownEntry] {
         (clients ?? [:])
             .map { key, value in
-                BreakdownEntry(id: key, value: value, cost: clientCosts?[key] ?? 0)
+                BreakdownEntry(id: key, value: value, cost: clientCosts?[key] ?? 0,
+                               unpricedTokens: clientUnpricedTokens?[key] ?? 0)
             }
             .sorted { lhs, rhs in
                 lhs.value == rhs.value ? lhs.id < rhs.id : lhs.value > rhs.value
@@ -85,10 +90,26 @@ nonisolated struct UsagePeriod: Decodable, Sendable {
     var modelEntries: [BreakdownEntry] {
         (models ?? [:])
             .map { key, value in
-                BreakdownEntry(id: key, value: value, cost: modelCosts?[key] ?? 0)
+                BreakdownEntry(id: key, value: value, cost: modelCosts?[key] ?? 0,
+                               unpricedTokens: modelUnpricedTokens?[key] ?? 0)
             }
             .sorted { lhs, rhs in
                 lhs.value == rhs.value ? lhs.id < rhs.id : lhs.value > rhs.value
             }
+    }
+
+    /// Joins the period's local `sessionActivity` overlay onto a session, the
+    /// same presentation-time copy `sessionWithActivity` makes on the desktop.
+    /// Only activity-capable clients receive it, archived sessions never do,
+    /// and an observation must beat the merged `liveActivity` by `canReplace`.
+    func sessionWithActivity(_ key: String, _ session: SessionUsage, now: Date = .now) -> SessionUsage {
+        guard !session.isArchived,
+              ["claude", "codex"].contains(session.client ?? ""),
+              let observation = sessionActivity?[key],
+              let state = observation.state, LiveSessionActivity.validStates.contains(state),
+              observation.canReplace(session.liveActivity, now: now) else { return session }
+        var result = session
+        result.liveActivity = observation
+        return result
     }
 }

@@ -72,10 +72,18 @@ struct SessionRow: View {
                 .overlay(alignment: .topLeading) {
                     ProviderMark(provider: session.client, size: markSize)
                         .overlay(alignment: .bottomTrailing) {
-                            if session.isRunning(at: now) {
+                            switch session.activityState(at: now) {
+                            case .running:
                                 Circle().fill(.mint).frame(width: 5, height: 5)
                                     .overlay { Circle().stroke(.background, lineWidth: 1) }
                                     .accessibilityHidden(true)
+                            case .waiting:
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 7))
+                                    .foregroundStyle(.orange)
+                                    .accessibilityHidden(true)
+                            case .ended, .idle:
+                                EmptyView()
                             }
                         }
                 }
@@ -92,6 +100,7 @@ struct SessionRow: View {
     private var activity: String {
         var parts: [String] = []
         if session.isArchived { parts.append(String(localized: "Archived")) }
+        if session.isSubagent { parts.append(String(localized: "Subagent")) }
         if let date = session.lastActivity {
             let time = Date.FormatStyle.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
                 .locale(Locale(identifier: "en_US_POSIX"))
@@ -153,7 +162,8 @@ struct SessionRow: View {
                 Text("Tokens unavailable").font(.footnote).foregroundStyle(.secondary)
             }
             if session.measuredTokens != nil, let cost = session.costUsd, cost.isFinite, cost >= 0 {
-                Text(MetricFormatter.usageCostFromUSD(cost, currency: preferences.currency))
+                Text(MetricFormatter.compactUsageCost(cost, unpricedTokens: session.unpricedTokens ?? 0,
+                                                      currency: preferences.currency))
                     .font(.caption2).foregroundStyle(.secondary)
             }
             SessionStatusView(session: session, now: now)

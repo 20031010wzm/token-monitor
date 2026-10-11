@@ -35,6 +35,10 @@ struct OverviewView: View {
                                 case .sessions:
                                     SessionsPreviewSection(
                                         sessions: sessionPeriod.sessions ?? [:],
+                                        activity: sessionPeriod.sessionActivity,
+                                        grokBotIDs: SessionListEntry.grokBotIDs(
+                                            stats.periods ?? [:],
+                                            authoritative: stats.grokBotSessionIds),
                                         showAll: showSessions
                                     )
                                 case .trend:

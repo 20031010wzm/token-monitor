@@ -35,7 +35,8 @@ struct DeviceRow: View {
                     Text(usage.totalTokens.map { showsDetails ? MetricFormatter.exactTokens($0) : MetricFormatter.tokens($0) } ?? "—")
                         .font(DesignTokens.rowValue)
                     if showsDetails, let cost = usage.costUsd, cost.isFinite {
-                        Text(MetricFormatter.usageCostFromUSD(cost, currency: preferences.currency))
+                        Text(MetricFormatter.compactUsageCost(cost, unpricedTokens: usage.unpricedTokens ?? 0,
+                                                              currency: preferences.currency))
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
