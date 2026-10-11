@@ -25,7 +25,7 @@ test('Worker APNs signs valid ES256 JWTs and distinguishes invalid tokens from t
   assert.deepEqual(await client.send('a'.repeat(64), { tokens: 123 }), { sent: true });
   const { url, options } = requests[0];
   assert.ok(options.signal instanceof AbortSignal);
-  assert.match(url, /^https:\/\/api.sandbox.push.apple.com\//);
+  assert.match(url, /^https:\/\/api\.sandbox\.push\.apple\.com\//);
   assert.equal(options.headers['apns-topic'], 'example.app.push-type.liveactivity');
   const [header, payload, signature] = options.headers.authorization.slice(7).split('.');
   assert.ok(crypto.verify('sha256', Buffer.from(`${header}.${payload}`), { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64url')));
