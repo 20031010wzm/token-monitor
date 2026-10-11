@@ -56,6 +56,7 @@ function transformed(type, summary, reason) {
 
 collector = startCollector({
   ...config.options,
+  getSessionUsageArchive: () => store.readMigrationEvidence(),
   // The owner's rule is "write unless the headless agent owns the archive". A
   // function cannot cross the thread boundary, so it is rebuilt from the same
   // PID file here.

@@ -119,6 +119,7 @@ test('the worker receives data only; callbacks stay with the owner', async () =>
     ...options,
     intervalMs: 60000,
     startBarrier: Promise.resolve(),
+    getSessionUsageArchive: () => ({ version: 1, sessions: {} }),
     dailyHistoryArchiveWriteEnabled: () => true
   }, { transformSettings: { projectsEnabled: false }, agentPidPath: '/tmp/agent.pid' });
   await flush();
@@ -361,6 +362,7 @@ test('a worker that exits unexpectedly falls back to this thread and replays its
   const inProcess = fakeInProcessCollector();
   const coordinator = createUsageHostCoordinator({ Worker: FakeWorker, startCollector: inProcess.startCollector });
   const { events, options } = recorder();
+  options.getSessionUsageArchive = () => ({ version: 1, sessions: {} });
   const runtime = coordinator.create(options);
   await flush();
   const tick = runtime.tick('manual');
@@ -372,6 +374,7 @@ test('a worker that exits unexpectedly falls back to this thread and replays its
   const collector = inProcess.started[0];
   // The original options, callbacks included: the owner's own transform runs again.
   assert.equal(collector.options, options);
+  assert.deepEqual(collector.options.getSessionUsageArchive(), { version: 1, sessions: {} });
   assert.deepEqual(collector.calls, [['tick', 'manual', {}]]);
   assert.deepEqual(events.filter(([kind]) => kind === 'diagnostic').map(([, event]) => event.code), ['usage-worker-failed']);
   assert.match(events.find(([kind]) => kind === 'log')[1], /worker crashed/);

@@ -27,6 +27,7 @@ const {
 } = require('../shared/usage/sessionUsageArchive');
 const {
   createSessionUsageArchiveStore,
+  readSessionUsageArchiveEvidence,
   readSessionUsageArchiveSnapshot
 } = require('../shared/usage/sessionUsageArchiveStore');
 const { createCursorUsageEventIndex } = require('../shared/providers/cursor/usageEvents');
@@ -116,6 +117,9 @@ const limitsOptions = {
 let sessionUsageArchive;
 const cursorUsageEvents = createCursorUsageEventIndex();
 const sessionUsageArchiveStore = dryRun ? null : createSessionUsageArchiveStore({ cursorUsageEvents });
+usageOptions.getSessionUsageArchive = () => dryRun
+  ? readSessionUsageArchiveEvidence()
+  : sessionUsageArchiveStore.readMigrationEvidence();
 
 function summaryWithSessionUsageArchive(summary, now = new Date()) {
   let visibleSummary = summary;

@@ -5,6 +5,8 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { sharedDataDir } = require('../config');
 const {
+  isSessionUsageArchiveEntryEvidence,
+  isSessionUsageArchiveEvidence,
   normalizeSessionUsageArchive,
   readSessionUsageArchive,
   sessionUsageArchivePath,
@@ -83,6 +85,62 @@ function readSessionUsageArchiveSnapshot(options = {}) {
   return readMigratedArchiveSnapshot(options) || legacy;
 }
 
+// This read-only acquisition is deliberately separate from tolerant display
+// reads. Only ENOENT proves an absent store; malformed JSON/rows and read errors
+// must never authorize migration as a supposedly empty retained archive.
+function readSessionUsageArchiveEvidence(options = {}) {
+  const databasePath = sessionUsageArchiveDatabasePath(options);
+  const legacyPath = sessionUsageArchivePath(options);
+  const statSync = options.statSync || fs.statSync;
+  const readFileSync = options.readFileSync || fs.readFileSync;
+  const Database = options.DatabaseSync || DatabaseSync;
+  const exists = filePath => {
+    try { statSync(filePath); return true; } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  const validate = archive => {
+    if (!isSessionUsageArchiveEvidence(archive)) throw new Error('invalid session archive migration evidence');
+    return archive;
+  };
+  const migrated = () => {
+    if (!exists(databasePath)) return null;
+    let candidate;
+    try {
+      candidate = new Database(databasePath, { readOnly: true });
+      candidate.exec('BEGIN');
+      const metadata = new Map(candidate.prepare('SELECT key, value FROM metadata').all().map(row => [row.key, row.value]));
+      if (Number(metadata.get('schema-version')) !== SESSION_ARCHIVE_DATABASE_VERSION) {
+        throw new Error('unsupported session archive migration evidence version');
+      }
+      if (metadata.get('legacy-migrated') !== '1') return null;
+      const archive = { version: 1, sessions: {} };
+      for (const row of candidate.prepare('SELECT session_key, entry_json FROM sessions').all()) {
+        const entry = JSON.parse(row.entry_json);
+        if (!isSessionUsageArchiveEntryEvidence(row.session_key, entry)) throw new Error('invalid session archive migration evidence');
+        archive.sessions[row.session_key] = entry;
+      }
+      return validate(archive);
+    } finally {
+      try { candidate?.close(); } catch (_) {}
+    }
+  };
+  const committed = migrated();
+  if (committed) return committed;
+  let legacy;
+  try {
+    legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+  } catch (error) {
+    // A writer may have committed SQLite and removed JSON during this read.
+    const replacement = migrated();
+    if (replacement) return replacement;
+    if (error?.code !== 'ENOENT' || exists(databasePath)) throw error;
+    return { version: 1, sessions: {} };
+  }
+  return migrated() || validate(legacy);
+}
+
 function createSessionUsageArchiveStore(options = {}) {
   const databasePath = sessionUsageArchiveDatabasePath(options);
   const legacyPath = sessionUsageArchivePath(options);
@@ -141,9 +199,13 @@ function createSessionUsageArchiveStore(options = {}) {
         database.exec('COMMIT');
         return;
       }
-      const legacy = existsSync(legacyPath)
-        ? normalizeSessionUsageArchive(JSON.parse(readFileSync(legacyPath, 'utf8')))
-        : normalizeSessionUsageArchive({});
+      const legacyValue = existsSync(legacyPath)
+        ? JSON.parse(readFileSync(legacyPath, 'utf8')) : { version: 1, sessions: {} };
+      // Do not delete a malformed row during the JSON-to-SQLite handoff and
+      // let a subsequent migration-evidence read certify the resulting empty
+      // store. Tolerant display normalization remains unchanged.
+      if (!isSessionUsageArchiveEvidence(legacyValue)) throw new Error('invalid session archive migration evidence');
+      const legacy = normalizeSessionUsageArchive(legacyValue);
       archive = legacy;
       const keys = Object.keys(legacy.sessions);
       const upsert = database.prepare(`
@@ -398,6 +460,7 @@ function createSessionUsageArchiveStore(options = {}) {
     clear,
     close,
     read: loadAll,
+    readMigrationEvidence: () => readSessionUsageArchiveEvidence({ ...options, databasePath, path: legacyPath }),
     refresh,
     databasePath,
     legacyPath
@@ -407,6 +470,7 @@ function createSessionUsageArchiveStore(options = {}) {
 module.exports = {
   SESSION_ARCHIVE_DATABASE_VERSION,
   createSessionUsageArchiveStore,
+  readSessionUsageArchiveEvidence,
   readSessionUsageArchiveSnapshot,
   sessionUsageArchiveDatabasePath
 };

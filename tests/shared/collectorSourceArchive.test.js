@@ -8,20 +8,31 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { collectUsageOnce, startCollector, localTodayKey, collectorAnchorTrust, configFingerprint } = require('../../src/shared/collector');
 const { applySessionUsageArchive, updateSessionUsageArchive } = require('../../src/shared/usage/sessionUsageArchive');
-const { applySourceDailyUsage } = require('../../src/shared/usage/sourceDailyUsage');
-const { extractUsageBundleFromTokscale } = require('../../src/shared/usage');
+const { normalizeClientName } = require('../../src/shared/usage');
 
 function contribution(date, tokens, model = 'opus', cost = tokens / 100, client = 'claude') {
   return { date, clients: [{ client, modelId: model, tokens: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 }, cost, messages: 1 }] };
 }
 
 function sourceGraph(now, sessions, extra = {}) {
-  sessions = sessions.map(row => ({ ...row, events: row.days.map((day, index) => ({
-    id: `sha256:${createHash('sha256').update(`${row.client}:${row.sessionId}:${day.date}:${index}`).digest('hex')}`, days: [day]
-  })) }));
+  const digest = value => `sha256:${createHash('sha256').update(value).digest('hex')}`;
+  const selected = extra.replacementClients || ['claude'];
+  const rawClients = [...new Set([...selected, ...sessions.map(row => row.client)])];
+  const replacementClients = rawClients.filter(client => selected.includes(client)
+    || selected.some(value => normalizeClientName(value) === normalizeClientName(client)));
   return { contributions: sessions.flatMap(row => row.days), sourceUsage: {
-    version: 1, eventIdentityVersion: 1, fullHistory: true, capturedAt: now.toISOString(), bucketTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    dayKey: localTodayKey(now), replacementClients: ['claude'], sessions, ...extra
+    version: 2, eventIdentityVersion: 2, fullHistory: true, capturedAt: now.toISOString(), bucketTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    dayKey: localTodayKey(now), ...extra, replacementClients,
+    scopes: rawClients.map(client => ({ id: digest(`domain:${client}`), clients: [client],
+      readStatus: extra.partialClients?.includes(client) ? 'partial' : 'complete', identityStatus: 'exact' })),
+    sessions: sessions.map(row => ({ client: row.client, sessionId: row.sessionId, scopeId: digest(`domain:${row.client}`),
+      events: row.days.map((day, index) => ({ id: digest(`${row.client}:${row.sessionId}:${day.date}:${index}`),
+        contributions: day.clients.map(value => {
+          const [year, month, date] = day.date.split('-').map(Number);
+          return { timestamp: new Date(year, month - 1, date, 12).getTime(), modelId: value.modelId,
+            providerId: value.providerId || '', cost: value.cost, messages: value.messages,
+            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, ...value.tokens } };
+        }) })) }))
   } };
 }
 
@@ -31,6 +42,7 @@ function optionsFor(t) {
   return { clients: 'claude', allTimeSince: '2026-01-01', deviceId: 'source-fixture',
     homeDir: dir, env: {}, wslScanEnabled: false, projectsEnabled: false,
     codexLocalUsageEnabled: false, includeHistory: true, dailyHistoryArchiveEnabled: true,
+    getSessionUsageArchive: () => ({ version: 1, sessions: {} }),
     dailyHistoryArchiveOptions: { path: path.join(dir, 'daily.json') },
     sessionMetadataDeps: { resolveSessionMetadata: () => null } };
 }
@@ -151,7 +163,7 @@ function anchorFrom(captured, now) {
 }
 
 for (const failure of ['throw', 'no-source', 'stale']) {
-  test(`${failure} graph preserves fresh native rows and retains only absent source IDs`, async t => {
+  test(`${failure} graph preserves accepted source accounting and watch retains its exact native delta`, async t => {
     const options = optionsFor(t);
     const now = new Date(2026, 9, 11, 12);
     const date = localTodayKey(now);
@@ -174,13 +186,13 @@ for (const failure of ['throw', 'no-source', 'stale']) {
       onSourceArchiveComputed: value => { cached = value; }
     });
     for (const name of ['today', 'month', 'allTime']) {
-      assert.equal(summary[name].totalTokens, 470);
-      assert.equal(summary[name].sessions['claude:a'].totalTokens, 400);
-      assert.equal(summary[name].sessions['claude:b'].totalTokens, 50);
+      assert.equal(summary[name].totalTokens, 120);
+      assert.equal(summary[name].sessions['claude:a'].totalTokens, 100);
+      assert.equal(summary[name].sessions['claude:b'], undefined);
       assert.equal(summary[name].sessions['claude:gone'].sourceState, 'unknown');
       assert.equal(summary[name].sessions['claude:gone'].retained, true);
       assert.equal(summary[name].sessions['claude:gone'].archived, undefined);
-      assert.equal(captured.windowsPeriods[name].totalTokens, 450);
+      assert.equal(captured.windowsPeriods[name].totalTokens, 100);
     }
     for (let i = 0; i < 2; i++) {
       const watch = await collectUsageOnce({ ...options, now: later, includeHistory: false,
@@ -205,41 +217,11 @@ test('fresh source replacement is scoped to the clients accepted from this graph
     runTokscale: async () => ({ entries: [nativeRow('a', 900), nativeRow('x', 700, 'codex'), nativeRow('new', 30, 'codex')] }),
     runGraph: async () => sourceGraph(later, [{ client: 'claude', sessionId: 'a', days: [contribution(date, 10)] }]),
     onAnchorComputed: value => { captured = value; } });
-  assert.equal(summary.allTime.totalTokens, 740);
-  assert.equal(summary.allTime.sessions['codex:x'].totalTokens, 700);
-  assert.equal(summary.allTime.sessions['codex:new'].totalTokens, 30);
-  assert.equal(captured.windowsPeriods.allTime.totalTokens, 740);
+  assert.equal(summary.allTime.totalTokens, 80);
+  assert.equal(summary.allTime.sessions['codex:x'].totalTokens, 70);
+  assert.equal(summary.allTime.sessions['codex:new'], undefined);
+  assert.equal(captured.windowsPeriods.allTime.totalTokens, 80);
 });
-
-for (const mismatch of ['zone', 'day']) {
-  test(`${mismatch} bucket mismatch rejects live and retained source projection on full and watch ticks`, async t => {
-    const options = optionsFor(t);
-    const now = new Date(2026, 9, 11, 1);
-    const today = localTodayKey(now);
-    const yesterday = localTodayKey(new Date(2026, 9, 10, 12));
-    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const extra = mismatch === 'zone' ? { bucketTimezone: zone === 'UTC' ? 'Asia/Tokyo' : 'UTC' } : { dayKey: yesterday };
-    let captured;
-    let cached;
-    const full = await collectUsageOnce({ ...options, now,
-      runTokscale: async () => ({ entries: [nativeRow('a', 100)] }),
-      runGraph: async () => sourceGraph(now, ['a', 'gone'].map(sessionId => ({ client: 'claude', sessionId,
-        days: [contribution(yesterday, sessionId === 'a' ? 100 : 50)] })), extra),
-      onAnchorComputed: value => { captured = value; }, onSourceArchiveComputed: value => { cached = value; } });
-    for (const name of ['today', 'month', 'allTime']) {
-      assert.equal(full[name].totalTokens, 100);
-      assert.equal(captured.windowsPeriods[name].totalTokens, 100);
-    }
-    assert.deepEqual(full.sessionArchiveSource.managedKeys, []);
-    for (const cachedSource of [undefined, cached]) {
-      const watch = await collectUsageOnce({ ...options, now, includeHistory: false, sourceArchiveSnapshot: cachedSource,
-        todayOnlyAnchor: anchorFrom(captured, now), runTokscale: async () => ({ entries: [nativeRow('a', 110)] }) });
-      for (const name of ['today', 'month', 'allTime']) assert.equal(watch[name].totalTokens, 110);
-      assert.deepEqual(watch.sessionArchiveSource.managedKeys, []);
-    }
-    assert.equal(captured.windowsPeriods.today.totalTokens, 100, today);
-  });
-}
 
 test('an absent source reappearing on watch adds only past days missing from each native anchor', async t => {
   const options = optionsFor(t);
@@ -368,42 +350,8 @@ for (const deferLiveHistoryCapture of [false, true]) {
         sourceArchiveSnapshot: cached, onSourceArchiveComputed: value => { cached = value; },
         runTokscale: async () => ({ entries: deferLiveHistoryCapture ? [nativeRow('a', 100)] : [] }) });
     }
-    assert.deepEqual(cached, { version: 1, sessions: [] });
+    assert.deepEqual(cached, { version: 2, accountingOwner: 'app', ownedClients: [], managedKeys: [], sessions: [] });
     assert.equal(reads, 1);
-  });
-}
-
-for (const reason of ['partial', 'stale']) {
-  test(`a ${reason} raw alias cannot promote its canonical native partition to replacement authority`, () => {
-    const now = new Date(2026, 9, 11, 12);
-    const today = localTodayKey(now);
-    const metadata = { capturedAt: now.toISOString(), bucketTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      dayKey: today, replacementAuthority: true };
-    const rows = [nativeRow('a', 500, 'devin-cli'), nativeRow('b', 50, 'devin-desktop')];
-    const nativePeriods = {};
-    const nativePartitions = {};
-    const summary = { sessionArchiveSource: { presentKeys: ['devin:a', 'devin:b'] } };
-    for (const name of ['today', 'month', 'allTime']) {
-      const bundle = extractUsageBundleFromTokscale({ entries: rows });
-      nativePeriods[name] = summary[name] = bundle.period;
-      nativePartitions[name] = bundle.byClient;
-    }
-    const sourceUsage = { version: 1, clients: reason === 'partial' ? ['devin-cli'] : ['devin-cli', 'devin-desktop'],
-      unresolvedClients: reason === 'partial' ? ['devin-desktop'] : [],
-      sourceSnapshots: { 'devin-cli': metadata, 'devin-desktop': { ...metadata,
-        ...(reason === 'partial' ? { replacementAuthority: false, reason: 'partial-client-scope' }
-          : { capturedAt: new Date(now.getTime() - 60000).toISOString() }) } },
-      sessions: ['a', 'gone'].map(sessionId => ({ ...metadata, client: 'devin-cli', sessionId, sourceState: 'present',
-        days: [contribution(today, sessionId === 'a' ? 5 : 20, 'opus', undefined, 'devin-cli')] })) };
-    applySourceDailyUsage(summary, sourceUsage, { todayKey: today, allTimeSince: '2026-01-01', clients: 'devin',
-      replaceLive: true, sourceClients: ['devin-cli'], nativePeriods, nativePartitions });
-    for (const name of ['today', 'month', 'allTime']) {
-      assert.equal(summary[name].totalTokens, 570);
-      assert.equal(summary[name].sessions['devin:a'].totalTokens, 500);
-      assert.equal(summary[name].sessions['devin:b'].totalTokens, 50);
-      assert.equal(summary[name].sessions['devin:gone'].sourceState, 'unknown');
-      assert.equal(nativePeriods[name].totalTokens, 550);
-    }
   });
 }
 
@@ -433,7 +381,7 @@ test(`collector projects independent raw source clients into one canonical parti
 });
 }
 
-test('partial antigravity-extension scope cannot suppress an authoritative CLI source correction', async t => {
+test('partial antigravity-extension prevents canonical migration and preserves the native legacy anchor', async t => {
   const options = { ...optionsFor(t), clients: 'antigravity', runAntigravitySync: async () => {} };
   const now = new Date(2026, 9, 11, 12);
   const today = localTodayKey(now);
@@ -446,45 +394,18 @@ test('partial antigravity-extension scope cannot suppress an authoritative CLI s
       { client: 'antigravity-extension', sessionId: 'extension', days: [contribution(today, 5, 'opus', 0.05, 'antigravity-extension')] }
     ], { replacementClients: ['antigravity-cli'], partialClients: ['antigravity-extension'] }),
     onAnchorComputed: value => { captured = value; }, onSourceArchiveComputed: value => { cached = value; } });
-  assert.equal(cached.sourceSnapshots['antigravity-cli'].replacementAuthority, true);
-  assert.equal(cached.sourceSnapshots['antigravity-extension'].replacementAuthority, false);
+  assert.deepEqual(cached.ownedClients, []);
   for (const name of ['today', 'month', 'allTime']) {
-    assert.equal(full[name].totalTokens, 50);
-    assert.equal(full[name].sessions['antigravity:cli'].totalTokens, 30);
+    assert.equal(full[name].totalTokens, 920);
+    assert.equal(full[name].sessions['antigravity:cli'].totalTokens, 900);
     assert.equal(full[name].sessions['antigravity:extension'].totalTokens, 20);
-    assert.equal(captured.windowsPeriods[name].totalTokens, 50);
+    assert.equal(captured.windowsPeriods[name].totalTokens, 920);
   }
+  assert.equal(full.history.summary.totalTokens, 920);
   const watch = await collectUsageOnce({ ...options, now, includeHistory: false, sourceArchiveSnapshot: cached,
     todayOnlyAnchor: anchorFrom(captured, now),
     runTokscale: async () => ({ entries: [nativeRow('cli', 35, 'antigravity-cli'), nativeRow('extension', 25, 'antigravity-extension')] }) });
   assert.equal(watch.allTime.totalTokens, 60);
-});
-
-test('identified retained IDs survive an unresolved residual without acquiring native replacement authority', () => {
-  const now = new Date(2026, 9, 11, 12);
-  const today = localTodayKey(now);
-  const metadata = { capturedAt: now.toISOString(), bucketTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    dayKey: today, replacementAuthority: false, projectIdentified: true };
-  const nativePeriods = {};
-  const nativePartitions = {};
-  const summary = { sessionArchiveSource: { presentKeys: ['claude:a'] } };
-  for (const name of ['today', 'month', 'allTime']) {
-    const bundle = extractUsageBundleFromTokscale({ entries: [nativeRow('a', 500)] });
-    nativePeriods[name] = summary[name] = bundle.period;
-    nativePartitions[name] = bundle.byClient;
-  }
-  applySourceDailyUsage(summary, { version: 1, clients: [], unresolvedClients: ['claude'],
-    sourceSnapshots: { claude: metadata }, sessions: ['a', 'gone'].map(sessionId => ({ ...metadata, client: 'claude', sessionId,
-      sourceState: 'present', days: [contribution(today, sessionId === 'a' ? 5 : 20)] }))
-  }, { todayKey: today, allTimeSince: '2026-01-01', clients: 'claude', replaceLive: true,
-    sourceClients: ['claude'], nativePeriods, nativePartitions });
-  for (const name of ['today', 'month', 'allTime']) {
-    assert.equal(summary[name].totalTokens, 520);
-    assert.equal(summary[name].sessions['claude:a'].totalTokens, 500);
-    assert.equal(summary[name].sessions['claude:gone'].sourceState, 'unknown');
-    assert.equal(summary[name].sessions['claude:gone'].liveActivity, undefined);
-    assert.equal(nativePeriods[name].totalTokens, 500);
-  }
 });
 
 for (const [cliId, desktopId] of [['old', 'live'], ['shared', 'shared']]) {
@@ -548,6 +469,7 @@ test('collector persists raw native presence across restart and targeted watch t
   const cli = { client: 'devin-cli', sessionId: 'shared', days: [contribution(today, 100, 'opus', 1, 'devin-cli')] };
   const desktop = { client: 'devin-desktop', sessionId: 'shared', days: [contribution(today, 5, 'opus', 0.05, 'devin-desktop')] };
   let omitted = false;
+  let graphSequence = 0;
   let scans = [];
   const updates = [];
   const runtimeOptions = { ...options, now,
@@ -560,7 +482,7 @@ test('collector persists raw native presence across restart and targeted watch t
         ] : []), ...(requested.has('claude') ? [nativeRow('c', 3)] : [])
       ] };
     },
-    runGraph: async () => sourceGraph(now, [...(!omitted ? [cli] : []), desktop,
+    runGraph: async () => sourceGraph(new Date(now.getTime() + ++graphSequence * 1000), [...(!omitted ? [cli] : []), desktop,
       { client: 'claude', sessionId: 'c', days: [contribution(today, 3)] }
     ], { replacementClients: ['devin-cli', 'devin-desktop', 'claude'] }),
     onUpdate: summary => { updates.push(summary); }, onError: error => { throw error; } };
@@ -645,7 +567,6 @@ for (const graphSucceeds of [true, false]) {
     const yesterday = new Date(2026, 9, 10, 12);
     const now = new Date(2026, 9, 11, 12);
     const yesterdayKey = localTodayKey(yesterday);
-    const today = localTodayKey(now);
     await collectUsageOnce({ ...options, now: yesterday,
       runTokscale: async () => ({ entries: [nativeRow('a', 100)] }),
       runGraph: async () => sourceGraph(yesterday, [{ client: 'claude', sessionId: 'a', days: [contribution(yesterdayKey, 100)] }]) });
@@ -656,8 +577,8 @@ for (const graphSucceeds of [true, false]) {
         if (!graphSucceeds) throw new Error('graph failed after midnight');
         return sourceGraph(now, []);
       }, onAnchorComputed: value => { captured = value; }, onSourceArchiveComputed: value => { cached = value; } });
-    assert.equal(cached.sessions[0].dayKey, yesterdayKey, 'omission preserves the original entry capture metadata');
-    assert.equal(cached.sourceSnapshots.claude.dayKey, graphSucceeds ? today : yesterdayKey);
+    assert.equal(cached.sessions[0].days[0].date, yesterdayKey, 'omission preserves the timestamped contribution');
+    assert.equal(cached.scopes[0].acceptedAt, (graphSucceeds ? now : yesterday).toISOString());
     assert.equal(full.history.summary.totalTokens, 100);
     assert.equal(full.today.totalTokens, 0);
     for (const name of ['month', 'allTime']) {
@@ -680,92 +601,46 @@ for (const graphSucceeds of [true, false]) {
   });
 }
 
-test('actual unresolved daily export retains omitted exact IDs without native replacement', async t => {
+test('unidentified events freeze accepted accounting until a complete exact ownership transfer', async t => {
   const options = optionsFor(t);
   const now = new Date(2026, 9, 11, 12);
   const today = localTodayKey(now);
+  const initialRows = ['a', 'b'].map(sessionId => ({ client: 'claude', sessionId,
+    days: [contribution(today, sessionId === 'a' ? 100 : 50)] }));
+  const initialGraph = sourceGraph(now, initialRows);
   const first = await collectUsageOnce({ ...options, now,
     runTokscale: async () => ({ entries: [nativeRow('a', 100), nativeRow('b', 50)] }),
-    runGraph: async () => sourceGraph(now, ['a', 'b'].map(sessionId => ({ client: 'claude', sessionId,
-      days: [contribution(today, sessionId === 'a' ? 100 : 50)] }))) });
+    runGraph: async () => initialGraph });
   const sessionArchive = updateSessionUsageArchive({}, first, now).archive;
   const later = new Date(now.getTime() + 60000);
-  const graph = sourceGraph(later, [{ client: 'claude', sessionId: 'a', days: [contribution(today, 40)] }]);
-  graph.sourceUsage.sessions[0].events = [
-    { id: graph.sourceUsage.sessions[0].events[0].id, days: [contribution(today, 30)] },
-    { id: null, days: [contribution(today, 10)] }
-  ];
+  const unidentified = sourceGraph(later, [{ client: 'claude', sessionId: 'a', days: [contribution(today, 40)] }]);
+  unidentified.sourceUsage.sessions[0].events[0].id = null;
   let captured;
   let cached;
-  const full = await collectUsageOnce({ ...options, now: later,
-    runTokscale: async () => ({ entries: [nativeRow('a', 40)] }), runGraph: async () => graph,
+  const rejected = await collectUsageOnce({ ...options, now: later,
+    runTokscale: async () => ({ entries: [nativeRow('a', 40)] }), runGraph: async () => unidentified,
     onAnchorComputed: value => { captured = value; }, onSourceArchiveComputed: value => { cached = value; } });
-  assert.equal(cached.sourceSnapshots.claude.replacementAuthority, false);
-  assert.equal(cached.sourceSnapshots.claude.projectIdentified, true);
-  assert.deepEqual(cached.clients, []);
-  assert.ok(cached.sessions.some(row => row.sessionId === 'b'), 'actual archive export must include the omitted exact ID');
-  assert.equal(full.history.summary.totalTokens, 90);
-  for (const name of ['today', 'month', 'allTime']) {
-    assert.equal(full[name].totalTokens, 90);
-    assert.equal(full[name].sessions['claude:a'].totalTokens, 40);
-    assert.equal(full[name].sessions['claude:b'].totalTokens, 50);
-    assert.equal(full[name].sessions['claude:b'].sourceState, 'unknown');
-    assert.equal(captured.windowsPeriods[name].totalTokens, 40);
-  }
-  for (const sourceArchiveSnapshot of [cached, undefined]) {
-    const watch = await collectUsageOnce({ ...options, now: later, includeHistory: false, sourceArchiveSnapshot,
-      todayOnlyAnchor: anchorFrom(captured, later), runTokscale: async () => ({ entries: [nativeRow('a', 40)] }) });
-    for (const name of ['today', 'month', 'allTime']) assert.equal(watch[name].totalTokens, 90);
-  }
+  assert.equal(rejected.history.summary.totalTokens, 150);
+  assert.equal(rejected.allTime.totalTokens, 150);
+  assert.equal(applySessionUsageArchive(rejected, sessionArchive, { now: later }).allTime.totalTokens, 150);
   const newest = new Date(later.getTime() + 60000);
   const moved = sourceGraph(newest, [
-    { client: 'claude', sessionId: 'a', days: [contribution(today, 10)] },
+    { client: 'claude', sessionId: 'a', days: [] },
     { client: 'claude', sessionId: 'new', days: [contribution(today, 2)] }
   ]);
-  moved.sourceUsage.sessions[0].events[0].id = null;
-  moved.sourceUsage.sessions[1].events[0].id = graph.sourceUsage.sessions[0].events[0].id;
-  const nativeRows = [nativeRow('a', 10), nativeRow('new', 2)];
+  moved.sourceUsage.sessions[1].events[0].id = initialGraph.sourceUsage.sessions[0].events[0].id;
   const corrected = await collectUsageOnce({ ...options, now: newest,
-    runTokscale: async () => ({ entries: nativeRows }), runGraph: async () => moved,
+    runTokscale: async () => ({ entries: [nativeRow('new', 2)] }), runGraph: async () => moved,
     onAnchorComputed: value => { captured = value; }, onSourceArchiveComputed: value => { cached = value; } });
-  assert.equal(cached.sourceSnapshots.claude.replacementAuthority, false);
-  assert.equal(cached.sourceSnapshots.claude.projectIdentified, true);
-  assert.equal(corrected.history.summary.totalTokens, 62);
-  assert.ok(corrected.sessionArchiveSource.managedKeys.includes('claude:b'));
-  for (const name of ['today', 'month', 'allTime']) {
-    assert.equal(corrected[name].totalTokens, 62);
-    assert.equal(corrected[name].sessions['claude:a'].totalTokens, 10);
-    assert.equal(corrected[name].sessions['claude:new'].totalTokens, 2);
-    assert.equal(corrected[name].sessions['claude:b'].totalTokens, 50);
-    assert.equal(captured.windowsPeriods[name].totalTokens, 12);
-  }
-  for (const sourceArchiveSnapshot of [cached, undefined, cached]) {
+  assert.equal(corrected.history.summary.totalTokens, 52);
+  assert.equal(corrected.allTime.totalTokens, 52);
+  assert.equal(corrected.allTime.sessions['claude:a'], undefined);
+  assert.equal(corrected.allTime.sessions['claude:b'].totalTokens, 50);
+  assert.equal(corrected.allTime.sessions['claude:new'].totalTokens, 2);
+  assert.equal(applySessionUsageArchive(corrected, sessionArchive, { now: newest }).allTime.totalTokens, 52);
+  for (const sourceArchiveSnapshot of [cached, undefined]) {
     const watch = await collectUsageOnce({ ...options, now: newest, includeHistory: false, sourceArchiveSnapshot,
-      todayOnlyAnchor: anchorFrom(captured, newest), runTokscale: async () => ({ entries: nativeRows }) });
-    for (const name of ['today', 'month', 'allTime']) assert.equal(watch[name].totalTokens, 62);
-  }
-  const omittedAt = new Date(newest.getTime() + 60000);
-  const omitted = sourceGraph(omittedAt, [{ client: 'claude', sessionId: 'new', days: [contribution(today, 2)] }]);
-  omitted.sourceUsage.sessions[0].events[0].id = moved.sourceUsage.sessions[1].events[0].id;
-  const absent = await collectUsageOnce({ ...options, now: omittedAt,
-    runTokscale: async () => ({ entries: [nativeRow('new', 2)] }), runGraph: async () => omitted,
-    onAnchorComputed: value => { captured = value; }, onSourceArchiveComputed: value => { cached = value; } });
-  assert.equal(absent.history.summary.totalTokens, 62);
-  assert.ok(cached.unresolvedSessions.some(row => row.sessionId === 'a'));
-  const archived = applySessionUsageArchive(absent, sessionArchive, { now: omittedAt });
-  for (const name of ['today', 'month', 'allTime']) {
-    assert.equal(absent[name].totalTokens, 62);
-    assert.equal(absent[name].sessions['claude:a'].totalTokens, 10);
-    assert.equal(absent[name].sessions['claude:a'].liveActivity, undefined);
-    assert.equal(archived[name].totalTokens, 62, 'generic session retention must not replay the old a100 snapshot');
-    assert.equal(captured.windowsPeriods[name].totalTokens, 2);
-  }
-  for (const sourceArchiveSnapshot of [cached, undefined, cached]) {
-    const watch = await collectUsageOnce({ ...options, now: omittedAt, includeHistory: false, sourceArchiveSnapshot,
-      todayOnlyAnchor: anchorFrom(captured, omittedAt), runTokscale: async () => ({ entries: [nativeRow('new', 2)] }) });
-    for (const name of ['today', 'month', 'allTime']) {
-      assert.equal(watch[name].totalTokens, 62);
-      assert.equal(watch[name].sessions['claude:a'].totalTokens, 10);
-    }
+      todayOnlyAnchor: anchorFrom(captured, newest), runTokscale: async () => ({ entries: [nativeRow('new', 2)] }) });
+    for (const name of ['today', 'month', 'allTime']) assert.equal(watch[name].totalTokens, 52);
   }
 });

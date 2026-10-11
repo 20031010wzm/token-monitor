@@ -2764,7 +2764,7 @@ const usageTransform = createUsageTransform({
 // in-process collector and `usageTransform` above runs on this thread.
 let latestUsageHost = null;
 function createElectronUsageRuntime(options) {
-  latestUsageHost = createUsageHost(options, {
+  latestUsageHost = createUsageHost({ ...options, getSessionUsageArchive: () => sessionUsageArchiveStore.readMigrationEvidence() }, {
     agentPidPath: AGENT_PID_PATH,
     transformSettings: usageTransformSettings(settings)
   });

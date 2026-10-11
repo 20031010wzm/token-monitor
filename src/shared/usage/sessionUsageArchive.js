@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
-const { PERIODS, normalizePeriod } = require('../usage');
+const { PERIODS, normalizePeriod, normalizeClientName } = require('../usage');
 const {
   cloneJson,
   hasSummaryPeriod,
@@ -68,6 +68,42 @@ function normalizedSessionFrom(value, fallbackKey) {
 
 function hasSessionUsage(session) {
   return numberValue(session?.totalTokens) > 0 || numberValue(session?.costUsd) > 0;
+}
+
+// Migration authority needs intact retained evidence, not the best-effort
+// normalization used for ordinary archive display. Reject the whole snapshot
+// if a row could otherwise be silently dropped or lose accounting.
+function evidenceRecord(candidate) {
+  return candidate && typeof candidate === 'object'
+    && [null, Object.prototype].includes(Object.getPrototypeOf(candidate));
+}
+
+function isSessionUsageArchiveEntryEvidence(key, entry) {
+  const counter = candidate => typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0;
+  if (typeof key !== 'string' || ['__proto__', 'constructor', 'prototype'].includes(key) || key.includes('\0')
+    || !evidenceRecord(entry) || typeof entry.client !== 'string' || !entry.client.trim()
+    || normalizeClientName(entry.client) !== entry.client || typeof entry.sessionId !== 'string' || !entry.sessionId.trim()
+    || key !== `${entry.client}:${entry.sessionId}` || !evidenceRecord(entry.periods)) return false;
+  const names = Object.keys(entry.periods);
+  if (!names.length || names.some(name => !PERIODS.includes(name))) return false;
+  return names.every(name => {
+    const row = entry.periods[name];
+    if (!evidenceRecord(row) || row.client !== entry.client || row.sessionId !== entry.sessionId
+      || !counter(row.totalTokens) || !counter(row.costUsd)) return false;
+    for (const field of ['outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'unclassifiedTokens']) {
+      if (row[field] !== undefined && !counter(row[field])) return false;
+    }
+    for (const field of ['models', 'modelCosts']) {
+      if (row[field] !== undefined && (!evidenceRecord(row[field]) || !Object.values(row[field]).every(counter))) return false;
+    }
+    return true;
+  });
+}
+
+function isSessionUsageArchiveEvidence(value) {
+  if (!evidenceRecord(value) || value.version !== 1 || !evidenceRecord(value.sessions)) return false;
+  return Reflect.ownKeys(value.sessions).every(key => Object.prototype.propertyIsEnumerable.call(value.sessions, key)
+    && isSessionUsageArchiveEntryEvidence(key, value.sessions[key]));
 }
 
 function normalizeSessionUsageArchive(value) {
@@ -188,6 +224,9 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
   const source = deviceRecord.sessionArchiveSource;
   const hasSource = source && typeof source === 'object';
   const managedKeys = new Set(source?.managedKeys || []);
+  const checkedClients = new Set((source?.boundaryCheckedClients || []).map(normalizeClientName));
+  const ownedClients = new Set((source?.ownedClients || []).map(normalizeClientName).filter(client => checkedClients.has(client)));
+  const legacyClients = new Set((source?.legacyClients || []).map(normalizeClientName));
   const scannedPeriods = new Map(PERIODS.map((periodName) => {
     const rawPeriod = deviceRecord?.periods?.[periodName] || deviceRecord?.[periodName];
     return [periodName, options.canonicalSummary === true
@@ -215,7 +254,7 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
         && (!session.sourceState || session.sourceState === 'present')) fullLiveKeys.add(key);
     }
     reconcileSessionSources(archive, scannedPeriods, fullLiveKeys, source, sourceArchivedKeys,
-      captureDate, changedKeys, options, managedKeys);
+      captureDate, changedKeys, options, managedKeys, ownedClients);
   }
   for (const periodName of PERIODS) {
     if (periodName === 'today' && archive.prunedDay && day < archive.prunedDay) continue;
@@ -227,6 +266,12 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
       if (!hasSessionUsage(session) && !(hasSource && periodName === 'today')) continue;
       const archiveKey = sessionKey(session.client, session.sessionId);
       if (!archiveKey) continue;
+      if (ownedClients.has(session.client)) {
+        // An unresolved legacy boundary is not migration proof. Preserve its
+        // original evidence; only a migrated ledger may retire these counters.
+        if (!legacyClients.has(session.client)) rememberOwnedSessionMetadata(archive, session, archiveKey, capturedAtIso, day, month, changedKeys);
+        continue;
+      }
       if (sourceArchivedKeys.has(archiveKey) || fullLiveKeys.has(archiveKey)) continue;
       const entry = archive.sessions[archiveKey] || {
         client: session.client,
@@ -283,6 +328,24 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
   return { archive, changedKeys };
 }
 
+// Source-owned counters live only in the ledger. The generic archive can
+// still retain descriptive metadata for an omitted ID, represented by zero.
+function rememberOwnedSessionMetadata(archive, session, key, capturedAt, day, month, changedKeys) {
+  const entry = archive.sessions[key];
+  if (newestSessionObservation(entry) > Date.parse(capturedAt)) return;
+  const prior = entry?.periods?.allTime;
+  const metadata = { client: session.client, sessionId: session.sessionId, totalTokens: 0 };
+  for (const field of ['title', 'projectId', 'projectLabel', 'sessionKind', 'parentSessionId']) {
+    if (session[field]) metadata[field] = session[field];
+    else if (prior?.[field]) metadata[field] = prior[field];
+  }
+  const next = normalizedSessionFrom(metadata, key);
+  if (entry && sameJson(prior, next)) return;
+  archive.sessions[key] = { client: session.client, sessionId: session.sessionId, capturedAt, day, month,
+    periodWindows: { allTime: { capturedAt } }, periods: { allTime: next }, sourceState: 'unknown' };
+  changedKeys.add(key);
+}
+
 function observeSessionSource(entry, state, sourcePath, observedAt, changedKeys, key) {
   const ownedPath = ownedSessionSourcePath(sourcePath);
   if (entry.sourceState !== state || entry.sourceObservedAt !== observedAt
@@ -299,14 +362,14 @@ function newestSessionObservation(entry) {
     ...Object.values(entry?.periodWindows || {}).map((window) => Date.parse(window.capturedAt || '') || 0));
 }
 
-function reconcileSessionSources(archive, periods, liveKeys, source, excludedKeys, capturedAt, changedKeys, options, managedKeys) {
+function reconcileSessionSources(archive, periods, liveKeys, source, excludedKeys, capturedAt, changedKeys, options, managedKeys, ownedClients) {
   const capturedAtIso = capturedAt.toISOString();
   const day = localDay(capturedAt);
   const month = localMonth(capturedAt);
   const rows = new Map(PERIODS.map((name) => [name, new Map(Object.values(periods.get(name).sessions || {})
     .map((row) => [sessionKey(row.client, row.sessionId), row]))]));
   for (const key of new Set([...Object.keys(archive.sessions), ...liveKeys])) {
-    if (excludedKeys.has(key)) continue;
+    if (excludedKeys.has(key) || ownedClients.has(key.slice(0, key.indexOf(':')))) continue;
     let entry = archive.sessions[key];
     if (newestSessionObservation(entry) > capturedAt.getTime()) continue;
     if (!liveKeys.has(key)) {
@@ -557,6 +620,8 @@ function applySessionUsageArchive(summary, archive, options = {}) {
   const now = toDate(options.now);
   const sourceManagedKeys = new Set(summary.sessionArchiveSource?.managedKeys || []);
   const managedKeys = new Set([...sourceManagedKeys, ...(summary.codexLocalSessionKeys || [])]);
+  const checkedClients = new Set((summary.sessionArchiveSource?.boundaryCheckedClients || []).map(normalizeClientName));
+  const ownedClients = new Set((summary.sessionArchiveSource?.ownedClients || []).map(normalizeClientName).filter(client => checkedClients.has(client)));
   const next = scrubSessionArchiveSource(summary, options);
   enrichManagedSessionMetadata(next, normalizedArchive, sourceManagedKeys);
   const targetPeriods = new Map();
@@ -574,7 +639,7 @@ function applySessionUsageArchive(summary, archive, options = {}) {
   const mergedRows = [];
   for (const [archiveKey, entry] of Object.entries(normalizedArchive.sessions)) {
     // The source/day projection already owns this ID, including a zero period.
-    if (managedKeys.has(archiveKey)) continue;
+    if (managedKeys.has(archiveKey) || ownedClients.has(entry.client)) continue;
     for (const periodName of PERIODS) {
       const session = entry.periods?.[periodName];
       if (!session || !hasSessionUsage(session) || !shouldApplyPeriod(periodName, entry, now)) continue;
@@ -661,6 +726,8 @@ module.exports = {
   applySessionUsageArchive,
   captureSessionUsageArchive,
   clearSessionUsageArchive,
+  isSessionUsageArchiveEntryEvidence,
+  isSessionUsageArchiveEvidence,
   normalizeSessionUsageArchive,
   readSessionUsageArchive,
   scrubSessionArchiveSource,

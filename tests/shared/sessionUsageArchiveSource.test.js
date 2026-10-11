@@ -350,9 +350,12 @@ test('SQLite roundtrip retains zero correction, source evidence and absent-perio
   const sourcePath = path.join(directory, 'owned-session.jsonl');
   const store = createSessionUsageArchiveStore(options);
   const value = summary({ [KEY]: row() }, { fullScan: true, presentKeys: [KEY], paths: { [KEY]: sourcePath } });
-  assert.equal(store.capture(value, NOW).error, null);
-  assert.equal(store.capture(summary({}, { fullScan: true, presentKeys: [KEY] }), LATER).error, null);
-  store.close();
+  try {
+    assert.equal(store.capture(value, NOW).error, null);
+    assert.equal(store.capture(summary({}, { fullScan: true, presentKeys: [KEY] }), LATER).error, null);
+  } finally {
+    store.close();
+  }
   const snapshot = readSessionUsageArchiveSnapshot(options);
   assert.equal(snapshot.sessions[KEY].periods.allTime.totalTokens, 0);
   assert.equal(snapshot.sessions[KEY].sourceState, 'present');
@@ -360,11 +363,14 @@ test('SQLite roundtrip retains zero correction, source evidence and absent-perio
   assert.equal(snapshot.sessions[KEY].sourceObservedAt, LATER.toISOString());
   assert.equal(snapshot.sessions[KEY].periodWindows.today.capturedAt, LATER.toISOString());
   const reopened = createSessionUsageArchiveStore(options);
-  t.after(() => reopened.close());
-  assert.equal(reopened.capture(value, NOW).error, null);
-  assert.equal(reopened.refresh().sessions[KEY].periods.allTime.totalTokens, 0);
-  assert.equal(reopened.capture(summary(), new Date(LATER.getTime() + 1000)).error, null);
-  assert.equal(reopened.refresh().sessions[KEY].sourceState, 'missing');
+  try {
+    assert.equal(reopened.capture(value, NOW).error, null);
+    assert.equal(reopened.refresh().sessions[KEY].periods.allTime.totalTokens, 0);
+    assert.equal(reopened.capture(summary(), new Date(LATER.getTime() + 1000)).error, null);
+    assert.equal(reopened.refresh().sessions[KEY].sourceState, 'missing');
+  } finally {
+    reopened.close();
+  }
 });
 
 
@@ -614,7 +620,7 @@ test('a source returning during ancestor proof is present, not missing', (t) => 
 
 test('full live reconciliation respects newer global prune frontiers', () => {
   const archive = captured();
-  const nextMonth = new Date('2026-11-01T09:00:00.000Z');
+  const nextMonth = new Date(2026, 10, 1, 12);
   updateSessionUsageArchive(archive, null, nextMonth);
   updateSessionUsageArchive(archive, summary({ [KEY]: row(25) }), LATER);
   assert.equal(archive.sessions[KEY].periods.today, undefined);

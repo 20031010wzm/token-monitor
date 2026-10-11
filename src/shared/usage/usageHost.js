@@ -46,6 +46,7 @@ const CALLER_OPTION_KEYS = Object.freeze([
   'onDiagnosticEvent',
   'logger',
   'dailyHistoryArchiveWriteEnabled',
+  'getSessionUsageArchive',
   'startBarrier'
 ]);
 

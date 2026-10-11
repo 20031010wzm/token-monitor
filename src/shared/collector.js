@@ -35,8 +35,9 @@ const { createWatcherHost } = require('./watcherHost');
 const { createSessionActivityScheduler } = require('./sessionActivityScheduler');
 const { activityWatchSources, activityClientsForPath, activityWatchIgnored } = require('./sessionActivityWatch');
 const { localDayKey, parseGraphResult, normalizeHistory, mergeHistories } = require('./history');
-const { retainDailyHistory, retainLiveDailyHistory, sourceSnapshotsFromGraphs, readDailyHistoryArchive, graphFromDailyHistoryArchive } = require('./dailyHistoryArchive');
+const { retainDailyHistory, retainLiveDailyHistory, captureLiveDailyHistory, sourceSnapshotsFromGraphs, readDailyHistoryArchive, graphFromDailyHistoryArchive } = require('./dailyHistoryArchive');
 const { applySourceDailyUsage } = require('./usage/sourceDailyUsage');
+const { readSessionUsageArchiveEvidence } = require('./usage/sessionUsageArchiveStore');
 const {
   createSubprocessTermination,
   terminationUnconfirmedError
@@ -860,8 +861,28 @@ async function collectHistoryOnce(options) {
   };
   if (options.dailyHistoryArchiveEnabled) {
     try {
+      let sessionUsageArchive;
+      if (rawGraphs.some(graph => graph.sourceUsage?.version === 2)) {
+        try {
+          sessionUsageArchive = options.sessionUsageArchive !== undefined ? options.sessionUsageArchive
+            : options.getSessionUsageArchive ? await options.getSessionUsageArchive()
+              : readSessionUsageArchiveEvidence(options.sessionUsageArchiveOptions || {});
+        } catch (error) {
+          // Unavailable generic evidence prevents first migration. It cannot
+          // revoke accepted source accounting or skip a partial-read lock.
+          try {
+            options.logger?.(`session archive migration evidence unavailable: ${error.message}`);
+          } catch (_) { /* diagnostics cannot revoke accepted accounting */ }
+        }
+      }
+      throwIfAborted(options.signal);
       const retainedGraph = retainDailyHistory(rawGraphs, {
         ...(options.dailyHistoryArchiveOptions || {}),
+        // Read before acceptance, not after ownership has retired the old
+        // counters. Runtime stores supply their current canonical snapshot.
+        sessionUsageArchive,
+        nativeRawClients: options.nativeRawClients,
+        nativePeriods: options.nativePeriods,
         liveDays: options.dailyHistoryLiveDays,
         pricingRevision: options.pricingRevision,
         customPricingActive: options.customPricingActive,
@@ -1203,10 +1224,9 @@ async function collectUsageOnce(options) {
   allTime = mergePeriods(windowsPeriods.allTime, wslBundle.allTime);
   throwIfAborted(options.signal);
 
-  // The renderer intentionally uses the live today period while a day is in
-  // progress. Callers that do not defer capture persist the largest complete
-  // live snapshot here; startCollector defers it until after transformUsage so
-  // the saved value matches the period delivered to the renderer.
+  // A full source scan establishes ownership before any aggregate is written.
+  // Carry today's live value as a transient overlay into that same capture;
+  // persisting it first would fabricate an overlapping legacy boundary.
   if (
     options.historyEnabled !== false
     && options.dailyHistoryArchiveEnabled
@@ -1214,13 +1234,17 @@ async function collectUsageOnce(options) {
     && periodHasUsage(today)
   ) {
     try {
-      const retainedLive = retainLiveDailyHistory(today, {
+      const liveOptions = {
         ...(options.dailyHistoryArchiveOptions || {}),
+        sourceProjection: options.sourceArchiveSnapshot,
         liveDays: dailyHistoryLiveDays,
         todayKey: localTodayKey(collectedAt),
         pricingRevision: options.pricingRevision,
         writeEnabled: options.dailyHistoryArchiveWriteEnabled
-      });
+      };
+      const retainedLive = options.includeHistory
+        ? captureLiveDailyHistory({ days: {}, liveDays: dailyHistoryLiveDays }, today, liveOptions)
+        : retainLiveDailyHistory(today, liveOptions);
       dailyHistoryLiveDays = retainedLive.liveDays || {};
     } catch (error) {
       if (typeof options.logger === 'function') options.logger(`daily live history archive failed: ${error.message}`);
@@ -1383,8 +1407,6 @@ async function collectUsageOnce(options) {
     summary.history = null;
   } else if (options.includeHistory) {
     throwIfAborted(options.signal);
-    let capturedSourceUsage = null;
-    let capturedSourceClients = new Set();
     let capturedSourceSnapshots = new Map();
     const history = await collectHistoryOnce({
       clients: normalizedClients,
@@ -1399,38 +1421,36 @@ async function collectUsageOnce(options) {
       dailyHistoryArchiveWriteEnabled: options.dailyHistoryArchiveWriteEnabled,
       dailyHistoryArchiveOptions: options.dailyHistoryArchiveOptions,
       dailyHistoryLiveDays,
+      getSessionUsageArchive: options.getSessionUsageArchive,
+      sessionUsageArchive: options.sessionUsageArchive,
+      sessionUsageArchiveOptions: options.sessionUsageArchiveOptions,
+      nativeRawClients: [...new Set(Object.values(nativeRawPartitions).flatMap(partitions => Object.keys(partitions)))],
+      nativePeriods: windowsPeriods,
       sourcePaths,
       onSourceUsage: (sourceUsage) => {
-        capturedSourceUsage = sourceUsage?.version === 1 && sourceUsage.fullHistory === true && sourceUsage.eventIdentityVersion === 1
-          && sourceUsage.bucketTimezone === summary.periodWindows.timeZone && sourceUsage.dayKey === localTodayKey(collectedAt)
-          ? sourceUsage : null;
-        capturedSourceSnapshots = sourceSnapshotsFromGraphs({ sourceUsage: capturedSourceUsage });
-        capturedSourceClients = new Set(capturedSourceUsage?.replacementClients || []);
-        for (const row of capturedSourceSnapshots.values()) capturedSourceClients.add(row.client);
+        capturedSourceSnapshots = sourceSnapshotsFromGraphs({ sourceUsage });
       },
       onRetainedSourceUsage: (sourceUsage) => {
-        options.onSourceArchiveComputed?.(sourceUsage || { version: 1, sessions: [] });
-        const sourceClients = Object.entries(sourceUsage?.sourceSnapshots || {})
-          .filter(([client, snapshot]) => capturedSourceClients.has(client) && snapshot.replacementAuthority === true
-            && snapshot.capturedAt === capturedSourceUsage?.capturedAt)
-          .map(([client]) => client);
-        const acceptedClients = new Set(sourceClients);
+        options.onSourceArchiveComputed?.(sourceUsage);
+        // The App ledger decides acceptance and owns the retained counters.
+        // Scanner metadata supplies inventory, never a second authority vote.
+        applySourceDailyUsage(summary, sourceUsage, {
+          todayKey: localTodayKey(collectedAt), allTimeSince,
+          replaceLive: !anchorUsed, nativePartitions, nativeRawPartitions, nativeRawPresence, nativePeriods: windowsPeriods,
+          nativeAnchor: anchorUsed ? anchor : null, clients: normalizedClients,
+          supplementalPeriods: Object.fromEntries(['today', 'month', 'allTime'].map(name => [name,
+            mergePeriods(wslBundle[name], codexLocalView?.[name] || emptyPeriod())]))
+        });
+        const ownedClients = new Set(sourceUsage?.ownedClients || []);
         const presentKeys = new Set(summary.sessionArchiveSource.presentKeys);
         for (const row of capturedSourceSnapshots.values()) {
-          if (!acceptedClients.has(row.client)) continue;
+          if (!ownedClients.has(row.client)) continue;
           const canonicalKey = `${normalizeClientName(row.client)}:${row.sessionId}`;
           if (!presentKeys.has(canonicalKey)) {
             presentKeys.add(canonicalKey);
             summary.sessionArchiveSource.presentKeys.push(canonicalKey);
           }
         }
-        applySourceDailyUsage(summary, sourceUsage, {
-          todayKey: localTodayKey(collectedAt), allTimeSince,
-          replaceLive: !anchorUsed, sourceClients, nativePartitions, nativeRawPartitions, nativeRawPresence, nativePeriods: windowsPeriods,
-          nativeAnchor: anchorUsed ? anchor : null, clients: normalizedClients,
-          supplementalPeriods: Object.fromEntries(['today', 'month', 'allTime'].map(name => [name,
-            mergePeriods(wslBundle[name], codexLocalView?.[name] || emptyPeriod())]))
-        });
         today = summary.today;
         month = summary.month;
         allTime = summary.allTime;
@@ -1447,7 +1467,7 @@ async function collectUsageOnce(options) {
     try {
       const sourceUsage = options.sourceArchiveSnapshot
         || graphFromDailyHistoryArchive([], readDailyHistoryArchive(options.dailyHistoryArchiveOptions || {})).sourceUsage
-        || { version: 1, sessions: [] };
+        || { version: 2, accountingOwner: 'app', ownedClients: [], managedKeys: [], sessions: [] };
       options.onSourceArchiveComputed?.(sourceUsage);
       applySourceDailyUsage(summary, sourceUsage, {
         todayKey: localTodayKey(collectedAt), allTimeSince, clients: normalizedClients,
@@ -3152,6 +3172,7 @@ function startCollector(options) {
             : visibleSummary.today;
           const retainedLive = retainLiveDailyHistory(retainedToday, {
             ...(options.dailyHistoryArchiveOptions || {}),
+            sourceProjection: sourceArchiveSnapshot,
             liveDays: liveDailyHistoryDays,
             todayKey: visibleDateKey,
             pricingRevision: tickPricingRevision,

@@ -13,8 +13,12 @@ const {
 } = require('./clientIdentitySplits');
 
 const ARCHIVE_VERSION = 1;
+const archiveReadCache = new Map();
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
-const { classifySessionSourcePath, ownedSessionSourcePath } = require('./usage/sessionSourceState');
+const { ownedSessionSourcePath } = require('./usage/sessionSourceState');
+const { emptyPeriod } = require('./usage');
+const { addArchivedSession, isSessionUsageArchiveEvidence } = require('./usage/sessionUsageArchive');
+const { captureSourceLedger, legacyCostsEqual, legacyDaysMatch, legacySessionAccounting, selectLegacyDay, largerLegacyPeriod, ledgerFromLegacyArchive, normalizeSourceLedger, projectSourceLedger, sourceSnapshotsFromGraphs } = require('./usage/sourceLedger');
 
 function sourceProjectionClient(value) {
   const client = normalizeTokscaleClientName(value);
@@ -79,12 +83,10 @@ function normalizeObservation(value, sourceIdentity = false) {
     messages,
     ...(typeof value.pricingRevision === 'string' ? { pricingRevision: value.pricingRevision } : {}),
     ...(unclassifiedTokens > 0 ? { unclassifiedTokens } : {}),
-    ...(tokenComponentsAvailable ? {
-      tokenComponentsAvailable: true,
-      ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
-      ...(cacheWriteTokens > 0 ? { cacheWriteTokens } : {}),
-      ...(outputTokens > 0 ? { outputTokens } : {})
-    } : {}),
+    ...(tokenComponentsAvailable ? { tokenComponentsAvailable: true } : {}),
+    ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
+    ...(cacheWriteTokens > 0 ? { cacheWriteTokens } : {}),
+    ...(outputTokens > 0 ? { outputTokens } : {}),
     ...(reasoningTokens > 0 ? { reasoningTokens } : {})
   };
 }
@@ -240,6 +242,10 @@ function normalizeDailyHistoryArchive(value) {
       if (day) normalized.unresolvedDays[date] = day;
     }
   }
+  if (value?.sourceLedger !== undefined) {
+    normalized.sourceLedger = recoverLegacyDayAllocations(normalizeSourceLedger(value.sourceLedger));
+    return normalized;
+  }
   for (const [rawClient, entry] of Object.entries(value?.sourceSnapshots || {})) {
     const client = sourceClient(rawClient);
     const metadata = sourceMetadata(entry);
@@ -285,10 +291,15 @@ function normalizeDailyHistoryArchive(value) {
       ...(validCapturedAt(entry.sourceObservedAt) ? { sourceObservedAt: entry.sourceObservedAt } : {})
     };
   }
-  suspendUnresolvedEventUnions(normalized);
-  const clients = Object.entries(normalized.sourceSnapshots || {})
-    .filter(([, entry]) => entry.replacementAuthority).map(([client]) => client).sort();
-  if (clients.length || Array.isArray(value?.sourceClients) || normalized.sourceSnapshots) normalized.sourceClients = clients;
+  if (normalized.sourceSnapshots || normalized.sourceSessions || value?.sourceClients?.length) {
+    normalized.sourceClients = value?.sourceClients || [];
+    normalized.sourceLedger = ledgerFromLegacyArchive(normalized, {
+      legacyBoundary: clients => legacyBoundary(normalized, clients)
+    });
+    delete normalized.sourceClients;
+    delete normalized.sourceSnapshots;
+    delete normalized.sourceSessions;
+  }
   return normalized;
 }
 
@@ -304,14 +315,6 @@ function sourceSessionId(value, client) {
   const id = value.trim();
   return id && !id.includes('\0') && id.toLowerCase() !== 'unknown'
     && !(client === 'copilot' && id.toLowerCase() === 'unknown-session') ? id : null;
-}
-
-function eventOwnershipKey(client, id) {
-  const raw = client.toLowerCase();
-  const family = raw.startsWith('cc-mirror/') ? 'claude'
-    : raw === '9router' ? 'gjc'
-      : ['antigravity', 'antigravity-cli', 'antigravity-extension'].includes(raw) ? 'antigravity' : client;
-  return `${family}:${id}`;
 }
 
 function validCapturedAt(value) {
@@ -408,108 +411,163 @@ function mergeUnresolvedDays(target, source, additive = false) {
   }
 }
 
-// The aggregate fold is additive by raw client/model. Providers are labels,
-// not accounting partitions; a residual keeps the aggregate's provider set.
-function remainderDays(aggregate, identified) {
-  if (!aggregate) return null;
-  const result = {};
-  for (const date of new Set([...Object.keys(aggregate), ...Object.keys(identified)])) {
-    const observations = {};
-    const whole = aggregate[date]?.observations || {};
-    const known = identified[date]?.observations || {};
-    for (const key of new Set([...Object.keys(whole), ...Object.keys(known)])) {
-      const row = whole[key];
-      const removed = known[key];
-      if (!row && removed) return null;
-      const residual = { ...row };
-      for (const field of ['tokens', 'messages', 'cost', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'unclassifiedTokens']) {
-        const difference = num(row?.[field]) - num(removed?.[field]);
-        if (difference < -1e-9 * Math.max(1, num(row?.[field]), num(removed?.[field]))) return null;
-        residual[field] = Math.max(0, difference);
+// Legacy aggregates cannot be proven disjoint by comparing numeric totals.
+// Keep one whole daily observation behind an exclusive boundary until identity
+// evidence can reconcile it; never add it to an event ledger during migration.
+function retainedSessionBoundary(sessionArchive, families) {
+  const periods = {};
+  const sessions = {};
+  const days = {};
+  const dayPeriods = {};
+  const clients = new Set();
+  for (const entry of Object.values(sessionArchive?.sessions || {})) {
+    if (!entry || typeof entry !== 'object') continue;
+    const client = sourceProjectionClient(entry.client);
+    if (!families.has(client)) continue;
+    if (Object.values(entry.periods || {}).some(row => num(row?.totalTokens) > 0 || num(row?.costUsd) > 0)) clients.add(client);
+    const key = `${client}:${entry.sessionId}`;
+    sessions[key] = { client, sessionId: entry.sessionId, sourceState: 'unknown' };
+    for (const name of ['today', 'month', 'allTime']) {
+      const session = entry.periods?.[name];
+      if (!session) continue;
+      // Only stored window metadata allocates a short period. capturedAt is
+      // collection time, not evidence that allTime usage happened on that day.
+      const window = entry.periodWindows?.[name] || {};
+      const bucket = name === 'today' ? window.day || entry.day : name === 'month' ? window.month || entry.month : '';
+      if (name === 'today' && !DAY_KEY_RE.test(bucket) || name === 'month' && !/^\d{4}-\d{2}$/.test(bucket)) continue;
+      const row = { ...session, client, sessionId: entry.sessionId };
+      if (name === 'today') {
+        addArchivedSession(dayPeriods[bucket] ||= emptyPeriod(), row, key);
       }
-      const observation = normalizeObservation(residual, true);
-      if (observation) observations[key] = observation;
+      const field = name === 'today' ? 'day' : 'month';
+      if (!periods[name] || name !== 'allTime' && bucket > periods[name][field]) {
+        periods[name] = { ...(name === 'allTime' ? {} : { [field]: bucket }), period: emptyPeriod() };
+      }
+      if (name === 'allTime' || periods[name][field] === bucket) addArchivedSession(periods[name].period, row, key);
     }
-    if (Object.keys(observations).length) result[date] = { date, activeTimeMs: 0, observations };
   }
-  return result;
+  for (const [date, period] of Object.entries(dayPeriods)) {
+    const day = allocatedLegacyDay(period, date);
+    if (day) days[date] = day;
+  }
+  return { periods, sessions, clients: [...clients], days, hasUsage: clients.size > 0 };
 }
 
-function sourceScansFromGraphs(graphs) {
-  const scans = new Map();
-  for (const graph of graphsArray(graphs)) {
-    const source = graph.sourceUsage;
-    const metadata = sourceMetadata(source);
-    if (source?.version !== 1 || source.fullHistory !== true || !metadata
-      || !Array.isArray(source.sessions) || !Array.isArray(source.replacementClients)) continue;
-    const partial = new Set((Array.isArray(source.partialClients) ? source.partialClients : []).map(sourceClient).filter(Boolean));
-    const selectedRaw = new Set(source.replacementClients.map(sourceClient).filter(Boolean));
-    const selected = new Set([...selectedRaw].map(sourceProjectionClient));
-    const clients = new Set(selectedRaw);
-    for (const entry of source.sessions) {
-      const client = sourceClient(entry?.client);
-      if (client && (partial.has(client) || selected.has(sourceProjectionClient(client)))) clients.add(client);
-    }
-    // A synthetic-only selection has no client replacement authority. Its
-    // partial clients may suspend earlier authority, but cannot acquire it.
-    for (const client of partial) clients.add(client);
-    for (const rawClient of Object.keys(source.rowsWithoutIdentity || {})) {
-      const client = sourceClient(rawClient);
-      if (client) clients.add(client);
-    }
-    for (const client of clients) {
-      const sessions = new Map();
-      const unresolvedSessionIds = new Set();
-      const inScope = !partial.has(client) && selected.has(sourceProjectionClient(client));
-      let reason = partial.has(client) || !inScope ? 'partial-client-scope' : '';
-      if (Object.entries(source.rowsWithoutIdentity || {}).some(([rawClient, count]) => sourceClient(rawClient) === client && num(count) > 0)) reason = 'identity-gap';
-      for (const entry of source.sessions.filter(entry => sourceClient(entry?.client) === client)) {
-        const sessionId = sourceSessionId(entry.sessionId, client);
-        const days = sourceDays(entry.days, client, true);
-        const events = sourceEvents(entry.events, client, true);
-        const key = `${client}:${sessionId}`;
-        if (!sessionId || !days || !events || !eventsMatchDays(events, days) || sessions.has(key)) {
-          reason = 'identity-gap';
-          if (sessionId) unresolvedSessionIds.add(sessionId);
-          continue;
-        }
-        sessions.set(key, { client, sessionId, ...metadata, days, events, sourceState: 'present' });
-        if (events.some(event => event.id === null && Object.keys(event.days).length)) reason = 'identity-gap';
-      }
-      const aggregateDays = Array.isArray(graph.contributions) ? sourceDays(graph.contributions
-        .map(day => ({ ...day, clients: (day.clients || []).filter(row => sourceClient(row?.client) === client) })), client, true) : null;
-      if (Array.isArray(graph.contributions) && (!aggregateDays
-        || !eventsMatchDays([...sessions.values()].map(entry => ({ days: entry.days })), aggregateDays))) reason = 'identity-gap';
-      const eventIds = new Set();
-      for (const entry of sessions.values()) for (const event of entry.events) {
-        if (event.id === null) continue;
-        if (eventIds.has(event.id)) reason = 'identity-gap';
-        eventIds.add(event.id);
-      }
-      const fallbackDays = remainderDays(aggregateDays, daysFromEvents([...sessions.values()]));
-      // A gap outside valid identified rows must not erase omitted retained
-      // IDs. Only the unmatched aggregate remainder uses the fallback lane.
-      const projectIdentified = inScope && fallbackDays !== null && eventIds.size ===
-        [...sessions.values()].flatMap(entry => entry.events.filter(event => event.id !== null)).length;
-      const previous = scans.get(client);
-      if (previous && Date.parse(previous.capturedAt) > Date.parse(metadata.capturedAt)) continue;
-      scans.set(client, { ...metadata, replacementAuthority: !reason, ...(reason ? { reason } : {}),
-        ...(reason && projectIdentified ? { projectIdentified: true } : {}),
-        ...(unresolvedSessionIds.size ? { unresolvedSessionIds: [...unresolvedSessionIds] } : {}),
-        sessions, aggregateDays, fallbackDays: projectIdentified ? fallbackDays : aggregateDays, graph });
-    }
-  }
-  return scans;
+function allocatedLegacyDay(period, date) {
+  const day = periodLiveDay(period, date);
+  return day && { ...day, sessionAllocation: legacySessionAccounting(period.sessions) };
 }
 
-// A complete scan replaces every day/model of each observed identity, including
-// zero usage. Only literal, complete client selections can grant that authority.
-function sourceSnapshotsFromGraphs(graphs) {
-  const sessions = new Map();
-  for (const scan of sourceScansFromGraphs(graphs).values()) {
-    if (scan.replacementAuthority) for (const [key, entry] of scan.sessions) sessions.set(key, entry);
+// R3 stored whole dated periods as well as days. Recover only their complete
+// matching observation, never a lifetime total or an unrelated generic row.
+function recoverLegacyDayAllocations(ledger) {
+  let recovered = ledger;
+  for (const [id, scope] of Object.entries(ledger.scopes)) {
+    if (scope.mode !== 'legacy') continue;
+    for (const [date, day] of Object.entries(scope.legacyDays || {})) {
+      if (!day.sessionAllocation) continue;
+      const period = emptyPeriod();
+      for (const [key, session] of Object.entries(day.sessionAllocation)) addArchivedSession(period, session, key);
+      const candidate = allocatedLegacyDay(period, date);
+      if (candidate && legacyDaysMatch(candidate, day, Object.keys(day.sessionAllocation).length)) continue;
+      if (recovered === ledger) recovered = { ...ledger, scopes: { ...ledger.scopes } };
+      const { sessionAllocation: _allocation, ...unallocated } = day;
+      recovered.scopes[id] = { ...recovered.scopes[id], legacyDays: { ...recovered.scopes[id].legacyDays, [date]: unallocated } };
+    }
+    const window = scope.legacyPeriods?.today;
+    const day = window && recovered.scopes[id].legacyDays?.[window.day];
+    if (!day || day.sessionAllocation) continue;
+    const candidate = allocatedLegacyDay(window.period, window.day);
+    if (!candidate) continue;
+    const selected = selectLegacyDay(day, candidate);
+    // Compatibility recovery may enrich a match, never replace accounting.
+    if (selected === day || selected === candidate) continue;
+    if (recovered === ledger) recovered = { ...ledger, scopes: { ...ledger.scopes } };
+    recovered.scopes[id] = { ...recovered.scopes[id], legacyDays: { ...recovered.scopes[id].legacyDays, [window.day]: selected } };
   }
-  return sessions;
+  return recovered === ledger ? ledger : normalizeSourceLedger(recovered);
+}
+
+function legacyBoundary(archive, clients, options = {}) {
+  const families = new Set(clients.map(sourceProjectionClient));
+  const select = days => Object.fromEntries(Object.entries(days || {}).map(([date, day]) => {
+    const normalized = normalizeDay({ ...day, observations: Object.values(day.observations || {})
+      .filter(row => families.has(sourceProjectionClient(row.client))) }, date, true);
+    if (normalized && day.sessionAllocation) normalized.sessionAllocation = legacySessionAccounting(Object.fromEntries(
+      Object.entries(day.sessionAllocation).filter(([, row]) => families.has(sourceProjectionClient(row.client)))));
+    return [date, normalized];
+  }).filter(([, day]) => day));
+  const retained = {};
+  const legacy = Object.values(archive.sourceLedger?.scopes || {}).filter(scope => scope.mode === 'legacy' && scope.legacyPeriods
+    && scope.clients.some(client => families.has(sourceProjectionClient(client))));
+  for (const source of [archive.days, archive.liveDays, archive.unresolvedDays, ...legacy.map(scope => scope.legacyDays)]) {
+    for (const [date, day] of Object.entries(select(source))) {
+      retained[date] = selectLegacyDay(retained[date], day);
+    }
+  }
+  const generic = retainedSessionBoundary(options.sessionUsageArchive, families);
+  for (const scope of legacy) {
+    for (const [name, candidate] of Object.entries(scope.legacyPeriods)) {
+      if (largerLegacyPeriod(candidate, generic.periods[name], name)) generic.periods[name] = candidate;
+    }
+    Object.assign(generic.sessions, scope.sessions);
+    generic.clients = [...new Set([...generic.clients, ...scope.clients])];
+  }
+  for (const [date, day] of Object.entries(generic.days)) {
+    retained[date] = selectLegacyDay(retained[date], day);
+  }
+  const hasRetainedUsage = generic.hasUsage || Object.values(generic.periods).some(row => row.period.totalTokens > 0 || row.period.costUsd > 0)
+    || Object.values(retained).some(day => dayTokens(day) > 0 || dayCost(day) > 0);
+  if (hasRetainedUsage && options.nativePeriods) {
+    // Once persisted evidence establishes a legacy boundary, preserve its
+    // ordinary whole-period maximum. A transient native observation alone can
+    // never establish that boundary or authorize exact ledger migration.
+    const entries = {};
+    for (const name of ['today', 'month', 'allTime']) {
+      for (const [key, session] of Object.entries(options.nativePeriods[name]?.sessions || {})) {
+        const entry = entries[key] ||= { client: session.client, sessionId: session.sessionId, periods: {}, periodWindows: {} };
+        entry.periods[name] = session;
+        entry.periodWindows[name] = name === 'today' ? { day: options.todayKey } : name === 'month' ? { month: options.todayKey?.slice(0, 7) } : {};
+      }
+    }
+    const native = retainedSessionBoundary({ sessions: entries }, families);
+    for (const [name, candidate] of Object.entries(native.periods)) {
+      if (largerLegacyPeriod(candidate, generic.periods[name], name)) generic.periods[name] = candidate;
+    }
+    Object.assign(generic.sessions, native.sessions);
+    generic.clients = [...new Set([...generic.clients, ...native.clients])];
+    for (const [date, day] of Object.entries(native.days)) {
+      retained[date] = selectLegacyDay(retained[date], day);
+    }
+  }
+  const days = retained;
+  return { days, hasRetainedUsage, hasUsage: hasRetainedUsage,
+    ...(Object.keys(generic.periods).length ? { periods: generic.periods, sessions: generic.sessions, clients: generic.clients } : {}) };
+}
+
+function captureSourceDailyHistory(archive, graphs, options) {
+  const retainedBoundaryChecked = isSessionUsageArchiveEvidence(options.sessionUsageArchive);
+  const boundaryOptions = retainedBoundaryChecked ? options : { ...options, sessionUsageArchive: undefined };
+  const result = captureSourceLedger(archive.sourceLedger, graphs, {
+    ...options, timeZone: options.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+    retainedBoundaryChecked,
+    canonicalClient: sourceProjectionClient,
+    legacyBoundary: (clients) => legacyBoundary(archive, clients, boundaryOptions),
+    matchLegacySession: (legacy, days) => {
+      const client = Object.values(legacy).flatMap(day => Object.values(day.observations || {}))[0]?.client;
+      const incoming = sourceDays(days, client, true);
+      return incoming && eventsMatchDays([{ days: incoming }], legacy);
+    }
+  });
+  if (Object.keys(result.ledger.scopes).length || Object.keys(result.ledger.observations || {}).length) archive.sourceLedger = result.ledger;
+  const clients = new Set(Object.values(result.ledger.scopes).flatMap(scope => scope.clients).map(sourceProjectionClient));
+  if (clients.size) {
+    archive.unresolvedDays ||= {};
+    removeSourceClients(archive.days, clients, archive.unresolvedDays);
+    removeSourceClients(archive.liveDays, clients, archive.unresolvedDays);
+  }
+  return { ...result, size: result.accepted.size, values: () => [...result.accepted.values()]
+    .map(scan => ({ ...scan, replacementAuthority: true })) };
 }
 
 function removeSourceClients(days, clients, unresolved) {
@@ -525,144 +583,6 @@ function removeSourceClients(days, clients, unresolved) {
     if (Object.keys(keep).length || num(day.activeTimeMs) > 0) days[date] = { ...day, observations: keep, componentSummary: undefined };
     else delete days[date];
   }
-}
-
-function newestSourceObservation(entry) {
-  return Math.max(Date.parse(entry?.capturedAt) || 0, Date.parse(entry?.sourceObservedAt) || 0,
-    Date.parse(entry?.observationFrontier) || 0);
-}
-
-function suspendUnresolvedEventUnions(archive) {
-  for (const entry of Object.values(archive.sourceSessions || {})) {
-    if (!entry.events.some(event => event.id === null && Object.keys(event.days).length)) continue;
-    const snapshot = archive.sourceSnapshots?.[entry.client];
-    if (snapshot?.replacementAuthority) {
-      snapshot.replacementAuthority = false;
-      snapshot.reason = 'identity-gap';
-      snapshot.projectIdentified = true;
-      snapshot.fallbackDays = {};
-    }
-  }
-}
-
-function captureSourceDailyHistory(archive, graphs, options) {
-  const scans = sourceScansFromGraphs(graphs);
-  const rejectedGraphs = new Set();
-  const rejectedClients = new Set();
-  for (const graph of graphsArray(graphs)) {
-    if (graph.sourceUsage || !Array.isArray(graph.contributions)) continue;
-    const fallbackFamilies = new Set();
-    for (const [client, previous] of Object.entries(archive.sourceSnapshots || {})) {
-      if (scans.has(client)) continue;
-      const family = sourceProjectionClient(client);
-      const familyAggregate = client !== family && graph.contributions.some(day =>
-        (day.clients || []).some(row => sourceClient(row?.client) === family));
-      const rows = graph.contributions.map(day => ({ ...day,
-        clients: (Array.isArray(day.clients) ? day.clients : []).filter(row =>
-          familyAggregate ? sourceClient(row?.client) === family : sourceClient(row?.client) === client)
-          .map(row => ({ ...row, client })) }));
-      if (!rows.some(day => day.clients.length)) continue;
-      const capturedAt = graph.meta?.generatedAt ?? graph.meta?.generated_at;
-      if (validCapturedAt(capturedAt) && Date.parse(capturedAt) < newestSourceObservation(previous)) {
-        rejectedGraphs.add(graph);
-        rejectedClients.add(client);
-        continue;
-      }
-      // This aggregate has no identity evidence. Preserve the last proven
-      // metadata and session states, but suspend exact replacement authority.
-      const fallbackDays = familyAggregate && fallbackFamilies.has(family) ? {} : sourceDays(rows, client, true);
-      if (familyAggregate) fallbackFamilies.add(family);
-      scans.set(client, { ...previous, replacementAuthority: false, reason: 'identity-gap',
-        projectIdentified: false,
-        ...(validCapturedAt(capturedAt) ? { observationFrontier: capturedAt } : {}),
-        sessions: new Map(), aggregateDays: fallbackDays, fallbackDays, graph });
-    }
-  }
-  const accepted = new Map();
-  accepted.rejectedClients = rejectedClients;
-  accepted.rejectedGraphs = rejectedGraphs;
-  for (const [client, scan] of scans) {
-    const capturedAt = newestSourceObservation(scan);
-    if (newestSourceObservation(archive.sourceSnapshots?.[client]) > capturedAt
-      || Object.values(archive.sourceSessions || {}).some(entry => entry.client === client && newestSourceObservation(entry) > capturedAt)) {
-      accepted.rejectedClients.add(client);
-      accepted.rejectedGraphs.add(scan.graph);
-      continue;
-    }
-    const incomingEvents = new Set([...scan.sessions.values()].flatMap(entry => entry.events.filter(event => event.id !== null)
-      .map(event => eventOwnershipKey(entry.client, event.id))));
-    if (Object.values(archive.sourceSessions || {}).some(entry => entry.client !== client
-      && Math.max(newestSourceObservation(entry), newestSourceObservation(archive.sourceSnapshots?.[entry.client])) > capturedAt
-      && entry.events.some(event => incomingEvents.has(eventOwnershipKey(entry.client, event.id))))) {
-      accepted.rejectedClients.add(client);
-      accepted.rejectedGraphs.add(scan.graph);
-      continue;
-    }
-    // A partial alias scan may suspend existing authority; it does not create
-    // a source-managed client when no complete snapshot has ever been seen.
-    if (!scan.replacementAuthority && scan.reason === 'partial-client-scope' && !archive.sourceSnapshots?.[client]
-      && !Object.keys(archive.sourceSnapshots || {}).some(raw => sourceProjectionClient(raw) === sourceProjectionClient(client))) continue;
-    archive.sourceSnapshots ||= {};
-    const { sessions, aggregateDays: _aggregateDays, fallbackDays, graph: _graph, ...metadata } = scan;
-    archive.sourceSnapshots[client] = { ...metadata,
-      ...(!scan.replacementAuthority ? { fallbackDays: fallbackDays || {} } : {}) };
-    accepted.set(client, scan);
-    archive.unresolvedDays ||= {};
-    const family = new Set([sourceProjectionClient(client)]);
-    removeSourceClients(archive.days, family, archive.unresolvedDays);
-    removeSourceClients(archive.liveDays, family, archive.unresolvedDays);
-    if (!scan.replacementAuthority && !scan.projectIdentified) {
-      continue;
-    }
-    archive.sourceSessions ||= {};
-    for (const [key, entry] of sessions) {
-      const sourcePath = ownedSessionSourcePath(options.sourcePaths?.[key]) || archive.sourceSessions[key]?.sourcePath;
-      archive.sourceSessions[key] = { ...entry, sourceObservedAt: entry.capturedAt, ...(sourcePath ? { sourcePath } : {}) };
-    }
-    for (const [key, entry] of Object.entries(archive.sourceSessions)) {
-      if (entry.client !== client || sessions.has(key)) continue;
-      const sourcePath = ownedSessionSourcePath(options.sourcePaths?.[key]) || entry.sourcePath;
-      const classified = classifySessionSourcePath(sourcePath, options.sourceStateDeps);
-      entry.sourceState = classified === 'missing' ? 'missing' : 'unknown';
-      entry.sourceObservedAt = scan.capturedAt;
-      if (sourcePath) entry.sourcePath = sourcePath;
-    }
-  }
-  // The digest includes the fork's dedup family, which can span clients.
-  // Remove only contributions whose newer owner was present in this scan.
-  const owners = new Map();
-  const observed = new Set();
-  for (const scan of accepted.values()) {
-    if (!scan.replacementAuthority && !scan.projectIdentified) continue;
-    for (const [key, entry] of scan.sessions) {
-      observed.add(key);
-      for (const event of entry.events) {
-        if (event.id === null) continue;
-        const identity = eventOwnershipKey(entry.client, event.id);
-        owners.set(identity, Math.max(owners.get(identity) || 0, Date.parse(entry.capturedAt)));
-      }
-    }
-  }
-  for (const [key, entry] of Object.entries(archive.sourceSessions || {})) {
-    if (observed.has(key)) continue;
-    // This scan may already have stamped an omitted source observation. Its
-    // usage timestamp still names the event contributions being replaced.
-    const frontier = accepted.has(entry.client) ? Date.parse(entry.capturedAt) : newestSourceObservation(entry);
-    const retained = entry.events.filter(event => event.id === null || (owners.get(eventOwnershipKey(entry.client, event.id)) ?? -Infinity) < frontier);
-    if (retained.length !== entry.events.length) {
-      const observedAt = Math.max(...entry.events.filter(event => owners.has(eventOwnershipKey(entry.client, event.id)))
-        .map(event => owners.get(eventOwnershipKey(entry.client, event.id))));
-      entry.events = retained;
-      entry.days = daysFromEvents(retained);
-      const classified = classifySessionSourcePath(entry.sourcePath, options.sourceStateDeps);
-      entry.sourceState = classified === 'missing' ? 'missing' : 'unknown';
-      if (newestSourceObservation(entry) < observedAt) entry.sourceObservedAt = new Date(observedAt).toISOString();
-    }
-  }
-  suspendUnresolvedEventUnions(archive);
-  if (archive.sourceSnapshots) archive.sourceClients = Object.entries(archive.sourceSnapshots)
-    .filter(([, scan]) => scan.replacementAuthority).map(([client]) => client).sort();
-  return accepted;
 }
 
 function graphsArray(graphs) {
@@ -747,7 +667,7 @@ function captureDailyHistoryArchive(existingArchive, graphs, options = {}) {
   const todayKey = String(options.todayKey || '').slice(0, 10);
   const hasTodayKey = DAY_KEY_RE.test(todayKey);
   const incomingDays = observationsFromGraphs(graphs, { sourceIdentity: true, rejectedGraphs: sourceScans.rejectedGraphs });
-  const managedClients = new Set(Object.keys(archive.sourceSnapshots || {}));
+  const managedClients = new Set(Object.values(archive.sourceLedger?.scopes || {}).flatMap(scope => scope.clients));
   const managedFamilies = new Set([...managedClients].map(sourceProjectionClient));
   for (const [date, day] of incomingDays) {
     for (const [key, observation] of Object.entries(day.observations)) {
@@ -845,7 +765,7 @@ function periodLiveDay(period, date) {
     const models = clientModels[client] && typeof clientModels[client] === 'object'
       ? clientModels[client]
       : {};
-    const modelIds = Object.keys(models);
+    const modelIds = [...new Set([...Object.keys(models), ...Object.keys(clientModelCosts[client] || {})])];
     let modeledTokens = 0;
     let modeledCost = 0;
     for (const modelId of modelIds) {
@@ -858,7 +778,8 @@ function periodLiveDay(period, date) {
     const clientTokens = Math.max(0, Math.round(num(clients[client])));
     const clientCost = Math.max(0, num(clientCosts[client]));
     const remainderTokens = Math.max(0, clientTokens - modeledTokens);
-    const remainderCost = Math.max(0, clientCost - modeledCost);
+    const terms = Math.max(modelIds.length, Object.keys(period.sessions || {}).length);
+    const remainderCost = legacyCostsEqual(clientCost, modeledCost, terms) ? 0 : Math.max(0, clientCost - modeledCost);
     if (modelIds.length === 0 || remainderTokens > 0 || remainderCost > 0) {
       addObservation(client, 'unknown', remainderTokens, remainderCost);
     }
@@ -869,12 +790,14 @@ function periodLiveDay(period, date) {
   const observed = [...observations.values()];
   const observedTokens = observed.reduce((sum, observation) => sum + observation.tokens, 0);
   const observedCost = observed.reduce((sum, observation) => sum + observation.cost, 0);
-  if (totalTokens > observedTokens || totalCost > observedCost) {
+  const remainderCost = legacyCostsEqual(totalCost, observedCost, Math.max(observed.length, Object.keys(period.sessions || {}).length))
+    ? 0 : Math.max(0, totalCost - observedCost);
+  if (totalTokens > observedTokens || remainderCost > 0) {
     addObservation(
       'unknown',
       'unknown',
       Math.max(0, totalTokens - observedTokens),
-      Math.max(0, totalCost - observedCost)
+      remainderCost
     );
   }
 
@@ -1027,63 +950,12 @@ function captureLiveDailyHistory(existingArchive, period, options = {}) {
   }
   const incoming = periodLiveDay(period, date);
   if (!incoming) return archive;
-  const sourceFamilies = new Set((archive.sourceClients || []).map(sourceProjectionClient));
-  const unresolvedFamilies = new Set(Object.entries(archive.sourceSnapshots || {})
-    .filter(([, scan]) => !scan.replacementAuthority).map(([client]) => sourceProjectionClient(client)));
-  const unresolved = {};
+  const sourceFamilies = new Set(Object.values(archive.sourceLedger?.scopes || {}).flatMap(scope => scope.clients).map(sourceProjectionClient));
   for (const [key, observation] of Object.entries(incoming.observations)) {
     if (sourceFamilies.has(observation.client)) delete incoming.observations[key];
-    else if (unresolvedFamilies.has(observation.client)) {
-      unresolved[key] = observation;
-      delete incoming.observations[key];
-    }
-  }
-  if (Object.keys(unresolved).length) {
-    archive.unresolvedDays ||= {};
-    const previous = archive.unresolvedDays[date];
-    const next = normalizeDay({ date, activeTimeMs: 0, observations: unresolved }, date, true);
-    if (next) {
-      const observations = { ...previous?.observations };
-      for (const client of new Set(Object.values(unresolved).map(row => row.client))) {
-        const select = day => normalizeDay({ date, observations: Object.values(day?.observations || {}).filter(row => row.client === client) }, date, true);
-        const incomingClient = select(next);
-        const previousClient = select(previous);
-        if (!incomingClient || (previousClient && !liveDayIsGreater(incomingClient, previousClient))) continue;
-        for (const [key, row] of Object.entries(observations)) if (row.client === client) delete observations[key];
-        Object.assign(observations, incomingClient.observations);
-      }
-      archive.unresolvedDays[date] = { ...next, activeTimeMs: previous?.activeTimeMs || 0, observations };
-      for (const [rawClient, snapshot] of Object.entries(archive.sourceSnapshots || {})) {
-        if (!unresolvedFamilies.has(sourceProjectionClient(rawClient)) || snapshot.replacementAuthority) continue;
-        if (Object.keys(archive.sourceSnapshots).filter(client => sourceProjectionClient(client) === sourceProjectionClient(rawClient)).length !== 1) continue;
-        const rows = Object.values(archive.unresolvedDays[date].observations)
-          .filter(row => row.client === sourceProjectionClient(rawClient)).map(row => ({ ...row, client: rawClient }));
-        if (!rows.length) continue;
-        let fallback = normalizeDay({ date, observations: rows }, date, true);
-        if (snapshot.projectIdentified) {
-          const present = Object.values(archive.sourceSessions || {}).filter(entry => entry.client === rawClient
-            && entry.sourceState === 'present' && !snapshot.unresolvedSessionIds?.includes(entry.sessionId));
-          const known = daysFromEvents(present)[date]?.observations || {};
-          const knownDay = { observations: known };
-          if (dayTokens(fallback) < dayTokens(knownDay)) continue;
-          if (Object.entries(known).some(([key, row]) => num(fallback?.observations[key]?.tokens) < row.tokens)) {
-            const tokens = dayTokens(fallback) - dayTokens(knownDay);
-            fallback = normalizeDay({ date, observations: [{ client: rawClient, modelId: 'unknown', tokens,
-              cost: Math.max(0, dayCost(fallback) - dayCost(knownDay)), messages: 0, unclassifiedTokens: tokens }] }, date, true);
-          } else fallback = normalizeDay({ date, observations: Object.entries(fallback?.observations || {}).map(([key, row]) => ({
-              ...row, tokens: row.tokens - num(known[key]?.tokens), cost: Math.max(0, row.cost - num(known[key]?.cost)),
-              messages: 0, tokenComponentsAvailable: false, cacheReadTokens: 0, cacheWriteTokens: 0,
-              outputTokens: 0, reasoningTokens: 0, unclassifiedTokens: row.tokens - num(known[key]?.tokens)
-            })) }, date, true);
-        }
-        snapshot.fallbackDays = { ...(snapshot.fallbackDays || {}) };
-        if (fallback) snapshot.fallbackDays[date] = fallback;
-        else delete snapshot.fallbackDays[date];
-      }
-    }
   }
   if (!Object.keys(incoming.observations).length) return archive;
-  if (archive.sourceClients?.length) delete incoming.componentSummary;
+  if (sourceFamilies.size) delete incoming.componentSummary;
   if (typeof options.pricingRevision === 'string') {
     for (const observation of Object.values(incoming.observations)) {
       observation.pricingRevision = options.pricingRevision;
@@ -1154,7 +1026,7 @@ function dayContribution(day) {
 }
 
 function graphFromDailyHistoryArchive(graphs, archive, options = {}) {
-  const normalizedArchive = graphsArray(graphs).length
+  const normalizedArchive = options.canonical === true ? archive : graphsArray(graphs).length
     ? captureDailyHistoryArchive(archive, graphs, options) : normalizeDailyHistoryArchive(archive);
   const currentDays = new Map();
   const todayKey = String(options.todayKey || '').slice(0, 10);
@@ -1175,52 +1047,27 @@ function graphFromDailyHistoryArchive(graphs, archive, options = {}) {
     }
   }
 
-  const clients = new Set(normalizedArchive.sourceClients || []);
-  const unresolvedClients = new Set(Object.entries(normalizedArchive.sourceSnapshots || {})
-    .filter(([, scan]) => !scan.replacementAuthority).map(([client]) => client));
+  const sourceUsage = normalizedArchive.sourceLedger ? projectSourceLedger(normalizedArchive.sourceLedger, options) : null;
   const projected = Object.fromEntries(currentDays);
-  removeSourceClients(projected, new Set([...clients, ...unresolvedClients].map(sourceProjectionClient)));
+  removeSourceClients(projected, new Set((sourceUsage?.ownedClients || []).map(sourceProjectionClient)));
   currentDays.clear();
   for (const [date, day] of Object.entries(projected)) currentDays.set(date, day);
-  for (const [date, unresolvedDay] of Object.entries(normalizedArchive.unresolvedDays || {})) {
+  const sourceDaysToProject = [
+    ...(sourceUsage?.sessions || []).flatMap(row => Object.values(sourceDays(row.days, row.client, true) || {})),
+    ...(sourceUsage?.aggregates || [])
+  ];
+  for (const sourceDay of sourceDaysToProject) {
+    const date = sourceDay.date;
     if (hasTodayKey && date > todayKey) continue;
-    const rows = Object.entries(unresolvedDay.observations).filter(([, observation]) =>
-      unresolvedClients.has(observation.client) && !normalizedArchive.sourceSnapshots[observation.client].fallbackDays);
-    if (!rows.length) continue;
     const day = currentDays.get(date) || { date, activeTimeMs: 0, observations: {} };
-    day.activeTimeMs = Math.max(day.activeTimeMs, unresolvedDay.activeTimeMs);
-    for (const [key, observation] of rows) day.observations[key] = observation;
+    for (const observation of Object.values(sourceDay.observations || {})) {
+      const canonical = normalizeObservation(observation);
+      if (!canonical) continue;
+      const key = observationKey(canonical);
+      day.observations[key] = addObservation(day.observations[key], canonical);
+    }
     delete day.componentSummary;
     currentDays.set(date, day);
-  }
-  for (const snapshot of Object.values(normalizedArchive.sourceSnapshots || {})) {
-    if (snapshot.replacementAuthority) continue;
-    for (const [date, fallbackDay] of Object.entries(snapshot.fallbackDays || {})) {
-      if (hasTodayKey && date > todayKey) continue;
-      const day = currentDays.get(date) || { date, activeTimeMs: 0, observations: {} };
-      for (const observation of Object.values(fallbackDay.observations)) {
-        const canonical = normalizeObservation(observation);
-        const key = observationKey(canonical);
-        day.observations[key] = addObservation(day.observations[key], canonical);
-      }
-      delete day.componentSummary;
-      currentDays.set(date, day);
-    }
-  }
-  for (const entry of Object.values(normalizedArchive.sourceSessions || {})) {
-    if (!clients.has(entry.client) && !normalizedArchive.sourceSnapshots?.[entry.client]?.projectIdentified) continue;
-    if (normalizedArchive.sourceSnapshots?.[entry.client]?.unresolvedSessionIds?.includes(entry.sessionId)) continue;
-    for (const [date, sourceDay] of Object.entries(entry.days)) {
-      if (hasTodayKey && date > todayKey) continue;
-      const day = currentDays.get(date) || { date, activeTimeMs: 0, observations: {} };
-      for (const observation of Object.values(sourceDay.observations)) {
-        const canonical = normalizeObservation(observation);
-        const key = observationKey(canonical);
-        day.observations[key] = addObservation(day.observations[key], canonical);
-      }
-      delete day.componentSummary;
-      currentDays.set(date, day);
-    }
   }
 
   const contributions = [...currentDays.values()]
@@ -1230,29 +1077,7 @@ function graphFromDailyHistoryArchive(graphs, archive, options = {}) {
   const activeTimeMs = contributions.reduce((sum, day) => sum + num(day.activeTimeMs), 0);
   const timeMetrics = graphTimeMetrics([normalizedArchive], activeTimeMs);
   return { contributions, ...(timeMetrics ? { timeMetrics } : {}),
-    ...(normalizedArchive.sourceSnapshots ? { sourceUsage: {
-      version: 1, fullHistory: false, clients: [...clients], replacementClients: [...clients],
-      sourceSnapshots: normalizedArchive.sourceSnapshots,
-      unresolvedClients: [...unresolvedClients],
-      unresolvedSessions: Object.values(normalizedArchive.sourceSessions || {})
-        .filter(entry => entry.unresolvedDays && Object.keys(entry.unresolvedDays).length)
-        .map(entry => ({ client: entry.client, sessionId: entry.sessionId,
-          sourceState: entry.sourceState, capturedAt: entry.capturedAt,
-          bucketTimezone: entry.bucketTimezone, dayKey: entry.dayKey,
-          days: Object.values(entry.unresolvedDays).map(dayContribution) })),
-      // Partial identity evidence can retain an omitted ID without replacing
-      // its native client. Keep that permission distinct from whole-client
-      // replacement authority. Null groups use the separate unresolved lane.
-      sessions: Object.values(normalizedArchive.sourceSessions || {}).filter(entry =>
-        (clients.has(entry.client) || normalizedArchive.sourceSnapshots?.[entry.client]?.projectIdentified === true)
-        && !normalizedArchive.sourceSnapshots?.[entry.client]?.unresolvedSessionIds?.includes(entry.sessionId))
-        .map(({ client, sessionId, days, sourceState, capturedAt, bucketTimezone, dayKey, eventIdentityVersion, sourceObservedAt, events }) => ({
-          client, sessionId, sourceState, capturedAt, bucketTimezone, dayKey, eventIdentityVersion, sourceObservedAt,
-          days: Object.values(clients.has(client) ? days : daysFromEvents(events.filter(event => event.id !== null))).map(dayContribution),
-          events: events.filter(event => event.id !== null)
-            .map(event => ({ id: event.id, days: Object.values(event.days).map(dayContribution) }))
-        }))
-    } } : {}) };
+    ...(sourceUsage ? { sourceUsage } : {}) };
 }
 
 function dailyHistoryArchivePath(options = {}) {
@@ -1263,7 +1088,7 @@ function validateDailyHistoryArchiveDocument(value, filePath) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`Could not parse JSON in ${filePath}: archive root must be an object`);
   }
-  for (const key of ['days', 'liveDays', 'sourceSessions', 'sourceSnapshots', 'unresolvedDays']) {
+  for (const key of ['days', 'liveDays', 'sourceSessions', 'sourceSnapshots', 'unresolvedDays', 'sourceLedger']) {
     if (Object.prototype.hasOwnProperty.call(value, key)
       && (!value[key] || typeof value[key] !== 'object' || Array.isArray(value[key]))) {
       throw new Error(`Could not parse JSON in ${filePath}: ${key} must be an object`);
@@ -1280,8 +1105,14 @@ function readDailyHistoryArchive(options = {}) {
     );
   }
   let content;
+  let signature;
   try {
+    const stat = fs.statSync(filePath, { bigint: true });
+    signature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    const cached = archiveReadCache.get(filePath);
+    if (options.fresh !== true && cached?.signature === signature) return cached.archive;
     content = fs.readFileSync(filePath, 'utf8');
+    if (cached?.signature === signature && cached.content === content) return cached.archive;
   } catch (error) {
     if (error?.code === 'ENOENT') return normalizeDailyHistoryArchive({});
     throw error;
@@ -1297,18 +1128,23 @@ function readDailyHistoryArchive(options = {}) {
     parseError.cause = error;
     throw parseError;
   }
-  return normalizeDailyHistoryArchive(validateDailyHistoryArchiveDocument(parsed, filePath));
+  const archive = normalizeDailyHistoryArchive(validateDailyHistoryArchiveDocument(parsed, filePath));
+  if (archiveReadCache.size >= 64) archiveReadCache.clear();
+  archiveReadCache.set(filePath, { signature, archive, content });
+  return archive;
 }
 
 function writeDailyHistoryArchive(archive, options = {}) {
   const write = options.writeJsonAtomic || writeJsonAtomic;
   write(dailyHistoryArchivePath(options), normalizeDailyHistoryArchive(archive));
+  archiveReadCache.delete(dailyHistoryArchivePath(options));
 }
 
 function clearDailyHistoryArchive(options = {}) {
   const unlink = options.unlinkSync || fs.unlinkSync;
   try {
     unlink(dailyHistoryArchivePath(options));
+    archiveReadCache.delete(dailyHistoryArchivePath(options));
     return true;
   } catch (error) {
     if (error?.code === 'ENOENT') return false;
@@ -1319,7 +1155,7 @@ function clearDailyHistoryArchive(options = {}) {
 function mergeLiveDaysIntoArchive(existingArchive, liveDays) {
   const archive = normalizeDailyHistoryArchive(existingArchive);
   const incoming = normalizeDailyHistoryArchive({ liveDays }).liveDays || {};
-  removeSourceClients(incoming, new Set((archive.sourceClients || []).map(sourceProjectionClient)));
+  removeSourceClients(incoming, new Set(Object.values(archive.sourceLedger?.scopes || {}).flatMap(scope => scope.clients).map(sourceProjectionClient)));
   for (const [date, liveDay] of Object.entries(incoming)) {
     const previous = archive.liveDays?.[date];
     if (!previous || liveDayIsGreater(liveDay, previous)) {
@@ -1337,10 +1173,10 @@ function archiveWriteEnabled(options = {}) {
 
 function retainDailyHistory(graphs, options = {}) {
   const previous = readDailyHistoryArchive(options);
-  const capture = (archive) => captureDailyHistoryArchive(
-    mergeLiveDaysIntoArchive(archive, options.liveDays),
-    graphs,
-    options
+  // Only persisted aggregates can establish a legacy migration boundary.
+  // This tick's transient native Today overlay is folded after acceptance.
+  const capture = (archive) => mergeLiveDaysIntoArchive(
+    captureDailyHistoryArchive(archive, graphs, options), options.liveDays
   );
   let next = capture(previous);
   // Ownership can change while a graph scan is running (for example, a
@@ -1350,16 +1186,30 @@ function retainDailyHistory(graphs, options = {}) {
     // The graph scan can take long enough for the other collector to update the
     // shared archive. Rebase on the latest file immediately before writing so
     // this scan cannot put that newer observation back on disk.
-    const latest = readDailyHistoryArchive(options);
+    const latest = readDailyHistoryArchive({ ...options, fresh: true });
     next = capture(latest);
     if (archiveWriteEnabled(options) && !isDeepStrictEqual(latest, next)) {
       writeDailyHistoryArchive(next, options);
     }
   }
-  return graphFromDailyHistoryArchive(graphs, next, options);
+  return graphFromDailyHistoryArchive([], next, { ...options, canonical: true });
 }
 
 function retainLiveDailyHistory(period, options = {}) {
+  const projection = options.sourceProjection;
+  if (projection?.version === 2 && projection.accountingOwner === 'app') {
+    const owned = new Set((projection.ownedClients || []).map(sourceProjectionClient));
+    const clients = Object.keys(period?.clients || {});
+    const costs = Object.keys(period?.clientCosts || {});
+    // Nothing from this tick belongs to generic daily retention. In particular
+    // activity-only ticks must not read/normalize the retained event ledger.
+    if (clients.every(client => owned.has(sourceProjectionClient(client)))
+      && costs.every(client => owned.has(sourceProjectionClient(client)))
+      && clients.reduce((sum, client) => sum + num(period.clients[client]), 0) === num(period?.totalTokens)
+      && Math.abs(costs.reduce((sum, client) => sum + num(period.clientCosts[client]), 0) - num(period?.costUsd)) < 1e-9) {
+      return { version: ARCHIVE_VERSION, days: {}, liveDays: options.liveDays || {} };
+    }
+  }
   const previous = readDailyHistoryArchive(options);
   const capture = (archive) => captureLiveDailyHistory(
     mergeLiveDaysIntoArchive(archive, options.liveDays),
@@ -1368,7 +1218,7 @@ function retainLiveDailyHistory(period, options = {}) {
   );
   let next = capture(previous);
   if (archiveWriteEnabled(options) && !isDeepStrictEqual(previous, next)) {
-    const latest = readDailyHistoryArchive(options);
+    const latest = readDailyHistoryArchive({ ...options, fresh: true });
     next = capture(latest);
     if (archiveWriteEnabled(options) && !isDeepStrictEqual(latest, next)) {
       writeDailyHistoryArchive(next, options);
