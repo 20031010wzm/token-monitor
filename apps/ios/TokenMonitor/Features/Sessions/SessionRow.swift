@@ -97,27 +97,7 @@ struct SessionRow: View {
     }
 
     private var clientName: String { ClientPresentation.displayName(for: session.client ?? "unknown") }
-    private var activity: String {
-        var parts: [String] = []
-        if session.isArchived { parts.append(String(localized: "Archived")) }
-        if session.isSubagent { parts.append(String(localized: "Subagent")) }
-        if let date = session.lastActivity {
-            let time = Date.FormatStyle.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
-                .locale(Locale(identifier: "en_US_POSIX"))
-            parts.append(date.formatted(Calendar.current.isDate(date, inSameDayAs: now)
-                                        ? time : time.month(.twoDigits).day(.twoDigits)))
-        }
-        if let count = session.messageCount, count > 0 {
-            parts.append("\(MetricFormatter.exactTokens(Double(count))) \(count == 1 ? "call" : "calls")")
-        }
-        if let percent = session.cacheHitPercent {
-            parts.append(percent > 0 && percent < 1 ? "<1%" : MetricFormatter.percent(percent))
-        }
-        if session.measuredTokens != nil, let speed = session.outputTokensPerSecond, speed.rounded() > 0 {
-            parts.append("\(MetricFormatter.tokens(speed.rounded())) tok/s")
-        }
-        return parts.joined(separator: " · ")
-    }
+    private var activity: String { session.activitySummary(now: now) }
 
     @ViewBuilder private var modelLabel: some View {
         if session.modelEntries.count > 1 {
@@ -169,5 +149,32 @@ struct SessionRow: View {
             SessionStatusView(session: session, now: now)
         }
         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+extension SessionUsage {
+    /// The "archived · subagent · time · calls · cache hit · tok/s" metadata
+    /// line — desktop's `activityParts` in sessionRows.js, shared by the
+    /// session row and the group row that quotes its display session.
+    func activitySummary(now: Date) -> String {
+        var parts: [String] = []
+        if isArchived { parts.append(String(localized: "Archived")) }
+        if isSubagent { parts.append(String(localized: "Subagent")) }
+        if let date = lastActivity {
+            let time = Date.FormatStyle.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+                .locale(Locale(identifier: "en_US_POSIX"))
+            parts.append(date.formatted(Calendar.current.isDate(date, inSameDayAs: now)
+                                        ? time : time.month(.twoDigits).day(.twoDigits)))
+        }
+        if let count = messageCount, count > 0 {
+            parts.append("\(MetricFormatter.exactTokens(Double(count))) \(count == 1 ? "call" : "calls")")
+        }
+        if let percent = cacheHitPercent {
+            parts.append(percent > 0 && percent < 1 ? "<1%" : MetricFormatter.percent(percent))
+        }
+        if measuredTokens != nil, let speed = outputTokensPerSecond, speed.rounded() > 0 {
+            parts.append("\(MetricFormatter.tokens(speed.rounded())) tok/s")
+        }
+        return parts.joined(separator: " · ")
     }
 }

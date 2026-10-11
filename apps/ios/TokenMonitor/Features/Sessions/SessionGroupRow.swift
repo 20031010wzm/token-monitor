@@ -46,25 +46,36 @@ struct SessionGroupRow: View {
         }
     }
 
-    private var subtitle: String {
-        var parts: [String] = []
-        if display?.displayTitle != nil {
-            parts.append(([clientName, modelLabel].compactMap { $0 }).joined(separator: " · "))
-        } else {
-            if let date = display?.lastActivity {
-                let time = Date.FormatStyle.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
-                    .locale(Locale(identifier: "en_US_POSIX"))
-                parts.append(date.formatted(Calendar.current.isDate(date, inSameDayAs: now)
-                                            ? time : time.month(.twoDigits).day(.twoDigits)))
-            }
-            if let count = display?.messageCount, count > 0 {
-                parts.append("\(MetricFormatter.exactTokens(Double(count))) \(count == 1 ? "call" : "calls")")
-            }
-        }
+    private var titled: Bool { display?.displayTitle != nil }
+
+    /// Tool and model joined for one line — the group's merged model readout.
+    private var identity: String {
+        ([clientName, modelLabel].compactMap { $0 }).joined(separator: " · ")
+    }
+
+    /// The line under the title: `client · model · N subagents` for a titled
+    /// group, `time · calls · % · tok/s · N subagents` for an untitled one —
+    /// the same strings the desktop group row puts in `subtitle`, with the
+    /// count underlined like the "N models" affordance since it expands.
+    private var subtitleBase: String {
+        titled ? identity : (display?.activitySummary(now: now) ?? "")
+    }
+
+    private var hasSubtitle: Bool { !subtitleBase.isEmpty || entry.subagentCount > 0 }
+
+    private var subtitle: Text {
+        var text = Text(subtitleBase)
         if entry.subagentCount > 0 {
-            parts.append(String(localized: "\(entry.subagentCount) subagents"))
+            if !subtitleBase.isEmpty { text = text + Text(" · ") }
+            text = text + Text("\(entry.subagentCount) subagents").underline()
         }
-        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+        return text
+    }
+
+    /// A titled group still prints its display session's activity line, the
+    /// same metadata a plain row carries — desktop keeps `display.activity`.
+    private var activity: String? {
+        titled ? display?.activitySummary(now: now) : nil
     }
 
     var body: some View {
@@ -75,12 +86,21 @@ struct SessionGroupRow: View {
                     : AnyLayout(HStackLayout(alignment: .top, spacing: 8))
                 layout {
                     VStack(alignment: .leading, spacing: DesignTokens.rowLineSpacing) {
-                        Text(display?.displayTitle ?? ([clientName, modelLabel].compactMap { $0 }.joined(separator: " · ")))
+                        Text(display?.displayTitle ?? identity)
                             .font(DesignTokens.rowTitle)
                             .lineLimit(1).truncationMode(.tail)
-                        if !subtitle.isEmpty {
-                            Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                        if hasSubtitle {
+                            subtitle.font(.caption2).foregroundStyle(.secondary)
                                 .lineLimit(1).truncationMode(.tail)
+                        }
+                        if let activity, !activity.isEmpty {
+                            Text(activity).font(.caption2).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.tail)
+                        }
+                        if !titled {
+                            Text(display?.sessionId ?? (entry.members.first?.key ?? entry.id))
+                                .font(.caption2).foregroundStyle(.tertiary)
+                                .lineLimit(1).truncationMode(.middle)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -139,14 +159,19 @@ struct SessionGroupRow: View {
     private var metrics: some View {
         VStack(alignment: dynamicTypeSize.isAccessibilitySize ? .leading : .trailing,
                spacing: DesignTokens.rowLineSpacing) {
-            Text(MetricFormatter.exactTokens(entry.tokens ?? 0)).font(DesignTokens.rowValue)
+            if let tokens = entry.tokens {
+                Text(MetricFormatter.exactTokens(tokens)).font(DesignTokens.rowValue)
+            } else {
+                Text("Tokens unavailable").font(.footnote).foregroundStyle(.secondary)
+            }
             if let cost = entry.cost {
                 Text(MetricFormatter.compactUsageCost(cost, unpricedTokens: entry.unpricedTokens,
                                                       currency: preferences.currency))
                     .font(.caption2).foregroundStyle(.secondary)
             }
-            Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                .font(.caption2).foregroundStyle(.secondary)
+            if let display {
+                SessionStatusView(session: display, now: now)
+            }
         }
         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
     }

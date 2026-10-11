@@ -50,9 +50,13 @@ nonisolated struct SessionListEntry: Identifiable, Sendable {
     }
 
     var tokens: Double? {
-        if isSessionGroup { return members.reduce(0) { $0 + ($1.session.measuredTokens ?? 0) } }
+        if isSessionGroup {
+            return members.allSatisfy { $0.session.measuredTokens == nil }
+                ? nil : members.reduce(0) { $0 + ($1.session.measuredTokens ?? 0) }
+        }
         if let session { return session.measuredTokens }
-        return reviews.reduce(0) { $0 + ($1.value.measuredTokens ?? 0) }
+        return reviews.allSatisfy { $0.value.measuredTokens == nil }
+            ? nil : reviews.reduce(0) { $0 + ($1.value.measuredTokens ?? 0) }
     }
     var cost: Double? {
         if isSessionGroup {
