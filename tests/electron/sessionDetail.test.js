@@ -29,7 +29,7 @@ test('session detail renders its heading before loading, errors and empty result
     const classes = new Set();
     return {
       children: [], isConnected: true, scrollLeft: 0, scrollWidth: 600, clientWidth: 200,
-      style: {}, getBoundingClientRect: () => ({ width: 600 }),
+      style: {}, dataset: {}, getBoundingClientRect: () => ({ width: 600 }),
       get childNodes() { return this.children.length ? this.children : [{ textContent: this._text || '' }]; },
       get textContent() { return this.children.length ? this.children.map(node => node.textContent).join('') : this._text || ''; },
       set textContent(value) { this.children = []; this._text = value; },
@@ -63,7 +63,10 @@ test('session detail renders its heading before loading, errors and empty result
     sessionDetailApi: { exchangeRows: detail => detail?.exchanges || [] },
     sessionRowsApi: require('../../src/electron/renderer/sessionRows'),
     copyToClipboard: (text) => { state.copied = text; },
-    exchangeNode: row => ({ textContent: row.title }),
+    exchangeNode: (row, max, expanded) => {
+      state.expands = [...(state.expands || []), expanded === true];
+      return { textContent: row.title };
+    },
     prefersReducedMotion: () => reducedMotion,
     setTimeout: callback => { timers.push(callback); return timers.length; },
     clearTimeout() {},
@@ -211,6 +214,25 @@ test('session detail renders its heading before loading, errors and empty result
   assert.strictEqual(els.sessionDetailHead.querySelector('.detail-sort'), restoredSort);
   assert.match(rendererSource, /refreshSessionDetailHeading\(\);\s*if \(state\.openSession\.renderOptions\)/,
     'ordinary Details refresh the heading in the normal render path');
+
+  // A live re-read re-inserts every row, so it has to reopen the exchange the
+  // reader had open and keep the reading position.
+  state.openSession.detail = { exchanges: [{ title: 'Reply', value: 10, startTime: 111 }] };
+  const expandedExchange = element();
+  expandedExchange.classList.add('expanded');
+  expandedExchange.dataset.startTime = '111';
+  els.sessionDetail.children = [expandedExchange];
+  els.sessionDetail.scrollTop = 40;
+  els.sessionDetail.scrollHeight = 100;
+  state.expands = [];
+  render({ detail: state.openSession.detail, preserveScroll: true });
+  assert.deepEqual(state.expands, [true], 'a refresh keeps the open exchange expanded');
+  assert.equal(els.sessionDetail.scrollTop, 40, 'a refresh keeps the reading position');
+  state.openSession.detail = { exchanges: [{ title: 'Reply', value: 10, startTime: 222 }] };
+  els.sessionDetail.children = [expandedExchange];
+  state.expands = [];
+  render({ detail: state.openSession.detail, preserveScroll: true });
+  assert.deepEqual(state.expands, [false], 'an exchange the reader never opened stays collapsed');
 
   state.openSession = { kind: 'session', client: 'reasonix', sessionId: 'reasonix:n', period: 'month', title: '' };
   state.stats = { nativeSessions: { today: { 'reasonix:n': { title: 'Wrong period' } },
@@ -414,14 +436,21 @@ function sessionDetailHarness(getSessionDetail) {
     visibleStatsSurface: () => 'main',
     isRendererWindowHidden: () => false,
     statsRenderScheduler: { request() {} },
+    sessionTooltipShouldHoldRender: () => false,
     renderSessionDetail: (args) => renders.push(args),
     window: { tokenMonitor: { getSessionDetail } }
   };
   vm.runInNewContext(
-    `${rendererSource.slice(start, end)}\nglobalThis.testOpenSessionDetail = openSessionDetail;`,
+    `${rendererSource.slice(start, end)}\nglobalThis.testOpenSessionDetail = openSessionDetail;\nglobalThis.testRefreshOpenSessionDetail = refreshOpenSessionDetail;`,
     context
   );
-  return { openSessionDetail: context.testOpenSessionDetail, renders, state };
+  return {
+    openSessionDetail: context.testOpenSessionDetail,
+    refreshOpenSessionDetail: context.testRefreshOpenSessionDetail,
+    context,
+    renders,
+    state
+  };
 }
 
 const detail = {
@@ -555,4 +584,75 @@ test('Reasonix rows enter the shared detail navigation path instead of a native 
   assert.match(rendererSource, /client === 'reasonix' && rowEl\.dataset\.detailUnavailable === 'true'/);
   assert.match(rendererSource, /sessionCost: client === 'reasonix' \? Number\(session\?\.reportedCostUsd \|\| 0\)/);
   assert.doesNotMatch(rendererSource, /nativeSessionBreakdown/);
+});
+
+test('an open session detail re-reads only when its usage moved, and never mid-hover', async () => {
+  const requests = [];
+  const pending = [];
+  let holdRead = false;              // defer the next getSessionDetail by hand
+  const { openSessionDetail, refreshOpenSessionDetail, context, renders, state } = sessionDetailHarness((args) => {
+    requests.push(args);
+    if (!holdRead) return Promise.resolve({ found: true, marker: requests.length });
+    const job = deferred();
+    pending.push(job);
+    return job.promise;
+  });
+  state.stats = { periods: { today: { sessions: { 'claude:s': { client: 'claude', totalTokens: 100, costUsd: 0.5 } } } } };
+
+  // A stats push that lands while the first read is still in flight has to stay
+  // unseen: writing it off against the older response would freeze the page.
+  holdRead = true;
+  const opening = openSessionDetail({ client: 'claude', sessionId: 's', sessionCost: 0.5, title: 'Session' });
+  state.stats.periods.today.sessions['claude:s'] = { client: 'claude', totalTokens: 150, costUsd: 0.75 };
+  pending[0].resolve({ found: true, marker: 1 });
+  await opening;
+  assert.equal(requests.length, 1);
+  holdRead = false;
+
+  // The push is re-read on the next tick, priced from the live row.
+  await refreshOpenSessionDetail();
+  assert.equal(requests.length, 2, 'a push that landed mid-flight is re-read');
+  assert.equal(requests[1].sessionCost, 0.75);
+  assert.equal(state.openSession.detail.marker, 2);
+  assert.equal(renders.at(-1).preserveScroll, true, 'a live re-read keeps the reading position');
+
+  // Caught up with the row, so an idle tick reads nothing.
+  await refreshOpenSessionDetail();
+  assert.equal(requests.length, 2, 'unchanged usage does not re-read the transcript');
+
+  // A rebuild replaces every row node, so a hover defers it to a later tick.
+  state.stats.periods.today.sessions['claude:s'] = { client: 'claude', totalTokens: 400, costUsd: 2 };
+  context.sessionTooltipShouldHoldRender = () => true;
+  await refreshOpenSessionDetail();
+  assert.equal(requests.length, 2, 'a held tooltip defers the rebuild');
+  context.sessionTooltipShouldHoldRender = () => false;
+  await refreshOpenSessionDetail();
+  assert.equal(requests.length, 3);
+  assert.equal(state.openSession.detail.marker, 3);
+
+  // A hover that starts mid-flight defers only the paint, not the read.
+  state.stats.periods.today.sessions['claude:s'] = { client: 'claude', totalTokens: 500, costUsd: 2.5 };
+  holdRead = true;
+  const inFlight = refreshOpenSessionDetail();
+  context.sessionTooltipShouldHoldRender = () => true;
+  pending[1].resolve({ found: true, marker: 4 });
+  await inFlight;
+  holdRead = false;
+  assert.equal(state.openSession.detail.marker, 4, 'the read still lands');
+  assert.equal(renders.at(-1).detail.marker, 3, 'but the paint waits for the hover to end');
+  context.sessionTooltipShouldHoldRender = () => false;
+  await refreshOpenSessionDetail();
+  assert.equal(requests.length, 4, 'the deferred paint does not read again');
+  assert.equal(renders.at(-1).detail.marker, 4);
+
+  // A reply that arrives after the page is closed must not repaint it.
+  state.stats.periods.today.sessions['claude:s'] = { client: 'claude', totalTokens: 600, costUsd: 3 };
+  holdRead = true;
+  const closing = refreshOpenSessionDetail();
+  assert.equal(requests.length, 5);
+  const rendersBeforeClose = renders.length;
+  state.openSession = null;
+  pending[2].resolve({ found: true, marker: 5 });
+  await closing;
+  assert.equal(renders.length, rendersBeforeClose, 'a closed page is not repainted');
 });

@@ -4697,14 +4697,82 @@ async function openSessionDetail({ client, sessionId, sessionCost, title, return
     period: state.period, detail: null, returnTo, titleFollowsSession: titleFollowsSession === true };
   state.openSession = request;
   renderSessionDetail({ loading: true });
+  // Read before the request, not after: a stats push that lands while it is in
+  // flight has to stay unseen so the next tick re-reads, instead of being written
+  // off against a response that predates it.
+  const liveSignature = sessionDetailLiveSignature();
   try {
     const detail = await window.tokenMonitor.getSessionDetail({ client, sessionId, period: request.period, sessionCost });
     if (state.openSession === request) {
       request.detail = detail;
+      request.liveSignature = liveSignature;
       applySessionDetailResult(request, { detail });
     }
   } catch (_) {
     applySessionDetailResult(request, { error: true });
+  }
+}
+
+function sessionLiveStatsEntry(request) {
+  if (!request) return null;
+  const periodKey = request.period || state.period;
+  return request.client === 'reasonix'
+    ? state.stats?.nativeSessions?.[periodKey]?.[request.sessionId] || null
+    : state.stats?.periods?.[periodKey]?.sessions?.[`${request.client}:${request.sessionId}`] || null;
+}
+
+function sessionLiveCost(entry, client) {
+  return client === 'reasonix' ? Number(entry?.reportedCostUsd || 0) : Number(entry?.costUsd || 0);
+}
+
+function sessionDetailLiveSignature() {
+  const entry = sessionLiveStatsEntry(state.openSession);
+  if (!entry) return '';
+  return JSON.stringify([
+    Number(entry.totalTokens) || 0,
+    Number(entry.costUsd) || 0,
+    Number(entry.reportedCostUsd) || 0
+  ]);
+}
+
+// The Details page is a point-in-time reading of a transcript: the reader runs
+// once per click, while the session keeps accruing usage through `stats:push`
+// and the refresh timer. Without a re-read, someone who opens a session mid-run
+// watches every other surface move while this one freezes until it is reopened.
+// Re-read only when the reported usage actually changed, and never mid-hover: a
+// rebuild replaces every row node, which would kill a tooltip or focus the
+// reader is using. The next tick picks it up once the hover ends.
+async function refreshOpenSessionDetail() {
+  const request = state.openSession;
+  if (request?.kind !== 'session' || !request.detail || request.detailLiveBusy) return;
+  if (visibleStatsSurface() !== 'main' || sessionTooltipShouldHoldRender()) return;
+  // A read that finished under a held tooltip is painted here instead of being
+  // dropped, so the page still catches up without reading the transcript again.
+  if (request.detailRenderPending) {
+    request.detailRenderPending = false;
+    renderSessionDetail({ detail: request.detail, preserveScroll: true });
+    return;
+  }
+  const signature = sessionDetailLiveSignature();
+  if (!signature || signature === request.liveSignature) return;
+  const sessionCost = sessionLiveCost(sessionLiveStatsEntry(request), request.client);
+  request.detailLiveBusy = true;
+  try {
+    const detail = await window.tokenMonitor.getSessionDetail({
+      client: request.client, sessionId: request.sessionId, period: request.period, sessionCost
+    });
+    if (state.openSession !== request) return;
+    request.sessionCost = sessionCost;
+    request.detail = detail;
+    request.liveSignature = signature;
+    // The reader can start a hover while the read is in flight, so the hold is
+    // rechecked here rather than trusted from the call site.
+    if (sessionTooltipShouldHoldRender()) { request.detailRenderPending = true; return; }
+    renderSessionDetail({ detail, preserveScroll: true });
+  } catch (_) {
+    // Keep the last good reading; the next stats tick tries again.
+  } finally {
+    request.detailLiveBusy = false;
   }
 }
 
@@ -4732,13 +4800,26 @@ function sessionDetailBack() {
   closeSessionDetail();
 }
 
-function renderSessionDetail({ detail, loading, error } = {}) {
+function renderSessionDetail({ detail, loading, error, preserveScroll = false } = {}) {
   els.breakdown.classList.add('hidden');
   els.sessionDetail.classList.remove('hidden');
   els.sessionDetailHead.classList.remove('hidden');
   const head = els.sessionDetailHead;       // static layer — rows scroll independently below it
   const container = els.sessionDetail;
   container.classList.remove('session-group-list');
+  // A live re-read re-inserts every row. Exchanges list newest first, so new
+  // ones land above the reading position; carry the reader down by however much
+  // the list grew instead of snapping back to the top.
+  const previousScroll = preserveScroll
+    ? { top: container.scrollTop, height: container.scrollHeight }
+    : null;
+  // A reader who opened an exchange keeps it open; a rebuild that collapsed it
+  // would look like the page had reset itself under them.
+  const expandedStarts = preserveScroll
+    ? new Set([...container.children]
+      .filter((node) => node.classList.contains('expanded'))
+      .map((node) => node.dataset.startTime))
+    : null;
   head.replaceChildren();
   container.replaceChildren();
 
@@ -4767,7 +4848,10 @@ function renderSessionDetail({ detail, loading, error } = {}) {
   head.append(sort);
 
   const max = Math.max(1, ...rows.map((row) => row.value));
-  for (const row of rows) container.append(exchangeNode(row, max));
+  for (const row of rows) container.append(exchangeNode(row, max, expandedStarts?.has(String(row.startTime)) === true));
+  if (previousScroll && previousScroll.top > 0) {
+    container.scrollTop = previousScroll.top + Math.max(0, container.scrollHeight - previousScroll.height);
+  }
 }
 
 function sessionDetailTitle() {
@@ -4982,7 +5066,7 @@ function detailNote(text) {
   return note;
 }
 
-function exchangeNode(row, max) {
+function exchangeNode(row, max, expanded = false) {
   const wrap = document.createElement('div');
   wrap.className = 'detail-exchange';
   wrap.innerHTML = '<div class="detail-ex-head"><span class="detail-chev">▸</span>'
@@ -5013,10 +5097,18 @@ function exchangeNode(row, max) {
   const turnsEl = wrap.querySelector('.detail-turns');
   for (const turn of row.turns) turnsEl.append(turnNode(turn));
 
-  const head = wrap.querySelector('.detail-ex-head');
-  head.addEventListener('click', () => {
-    const collapsed = turnsEl.classList.toggle('hidden');
-    wrap.querySelector('.detail-chev').textContent = collapsed ? '▸' : '▾';
+  // The open/closed choice is DOM state, so a live re-read has to be told which
+  // exchange to reopen. `startTime` is the stable identity a row carries; its key
+  // is a positional index that shifts every time a new turn arrives.
+  wrap.dataset.startTime = String(row.startTime);
+  const setExpanded = (open) => {
+    turnsEl.classList.toggle('hidden', !open);
+    wrap.classList.toggle('expanded', open);
+    wrap.querySelector('.detail-chev').textContent = open ? '▾' : '▸';
+  };
+  setExpanded(expanded);
+  wrap.querySelector('.detail-ex-head').addEventListener('click', () => {
+    setExpanded(turnsEl.classList.contains('hidden'));
   });
   return wrap;
 }
@@ -6852,6 +6944,7 @@ function render() {
       state.openSession.renderOptions = null;
       renderSessionDetail(options);
     }
+    void refreshOpenSessionDetail();
   } else {
     els.homePanel.classList.add('hidden');
     els.limitsPanel.classList.add('hidden');
