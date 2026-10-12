@@ -380,6 +380,70 @@ function parseCodebuddyTranscriptLines(lines) {
   return events;
 }
 
+// Pi (pi.dev) writes one JSONL entry per message. Only `message` entries carry
+// conversation: a user message is always a real prompt boundary (tool output
+// arrives as a separate `toolResult` role and compaction summaries are their own
+// `compaction` entry), and each assistant message is one API response with its
+// own usage, so nothing has to be de-duplicated across content blocks. Pi
+// follows OpenAI's convention: `totalTokens` is input + output + cacheRead +
+// cacheWrite, and `reasoning` is an informational subset of output.
+function piPromptText(content) {
+  if (typeof content === 'string') return cleanPromptText(content) || null;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .filter((part) => part && part.type === 'text')
+    .map((part) => String(part.text || ''))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (text) return text;
+  const images = content.filter((part) => part && part.type === 'image').length;
+  if (!images) return null;
+  return images > 1 ? `[${images} images]` : '[image]';
+}
+
+function parsePiTranscriptLines(lines) {
+  const events = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let obj;
+    try { obj = JSON.parse(trimmed); } catch (_) { continue; }
+    if (obj.type !== 'message') continue;
+    const message = obj.message || {};
+    const timestamp = obj.timestamp || '';
+    if (message.role === 'assistant' && message.usage) {
+      const u = message.usage;
+      const tools = Array.isArray(message.content)
+        ? message.content.filter((part) => part && part.type === 'toolCall').map((part) => part.name)
+        : [];
+      events.push({
+        kind: 'turn',
+        timestamp,
+        tokens: makeTokens({
+          input: u.input,
+          output: u.output,
+          cacheRead: u.cacheRead,
+          cacheWrite: u.cacheWrite,
+          reasoning: u.reasoning
+        }),
+        // Pi prices each reply itself; `readSessionDetail` prefers this over the
+        // proportional split of the session subtotal.
+        cost: num(u.cost && u.cost.total),
+        tools: uniqueTools(tools)
+      });
+    } else if (message.role === 'user') {
+      const text = piPromptText(message.content);
+      if (text) events.push({ kind: 'prompt', timestamp, text });
+    }
+  }
+  return events;
+}
+
+function parsePiTranscript(text) {
+  return parsePiTranscriptLines(String(text || '').split(/\r?\n/));
+}
+
 function emptyTokens() {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
 }
@@ -629,7 +693,9 @@ function readSessionDetail({ client, sessionId, period = 'total', sessionCost = 
     events = parsed ? parsed.events
       : (client === 'codebuddy' || client === 'workbuddy')
         ? parseCodebuddyTranscriptLines(lines)
-        : parseClaudeTranscriptLines(lines);
+        : client === 'pi'
+          ? parsePiTranscriptLines(lines)
+          : parseClaudeTranscriptLines(lines);
   } catch (error) {
     if (error.code === 'ENOENT') return { found: false, client, sessionId, period, exchanges: [], totals: totalsOf([], sessionCost) };
     return {
@@ -639,9 +705,21 @@ function readSessionDetail({ client, sessionId, period = 'total', sessionCost = 
   }
   const now = new Date((deps.now || Date.now)());
   const grouped = filterExchangesByPeriod(groupEvents(events), period, now);
-  distributeCost(grouped, sessionCost);
+  // Pi prices every reply in `usage.cost.total`, so use the reported per-turn
+  // cost instead of splitting the session subtotal the way Claude/Codex do. A
+  // provider that reports no price (all zeros) falls back to that split.
+  const reportedCost = client === 'pi'
+    ? grouped.reduce((sum, ex) => sum + ex.turns.reduce((turnSum, t) => turnSum + num(t.costEstimate), 0), 0)
+    : 0;
+  let costUsd = num(sessionCost);
+  if (reportedCost > 0) {
+    sumRealCost(grouped);
+    costUsd = reportedCost;
+  } else {
+    distributeCost(grouped, sessionCost);
+  }
   return {
-    found: true, client, sessionId, period, exchanges: grouped, totals: totalsOf(grouped, sessionCost),
+    found: true, client, sessionId, period, exchanges: grouped, totals: totalsOf(grouped, costUsd),
     ...(parsed ? { canonicalSessionId: parsed.canonicalSessionId } : {})
   };
 }
@@ -650,6 +728,7 @@ module.exports = {
   parseClaudeTranscript,
   parseCodebuddyTranscript,
   parseCodexTranscript,
+  parsePiTranscript,
   makeTokens,
   readCodebuddyExtensionSessionDetail,
   groupEvents,
