@@ -48,6 +48,12 @@ test('session detail renders its heading before loading, errors and empty result
           if (found) return found;
         }
         return null;
+      },
+      querySelectorAll(selector) {
+        return this.children.flatMap(child => [
+          ...(`.${child.className}` === selector ? [child] : []),
+          ...(child.querySelectorAll?.(selector) || [])
+        ]);
       }
     };
   }
@@ -65,7 +71,7 @@ test('session detail renders its heading before loading, errors and empty result
     copyToClipboard: (text) => { state.copied = text; },
     exchangeNode: (row, max, expanded) => {
       state.expands = [...(state.expands || []), expanded === true];
-      return { textContent: row.title };
+      return { textContent: row.title, dataset: { startTime: String(row.startTime) }, querySelector: () => null };
     },
     prefersReducedMotion: () => reducedMotion,
     setTimeout: callback => { timers.push(callback); return timers.length; },
@@ -656,4 +662,111 @@ test('an open session detail re-reads only when its usage moved, and never mid-h
   pending[2].resolve({ found: true, marker: 5 });
   await closing;
   assert.equal(renders.length, rendersBeforeClose, 'a closed page is not repainted');
+});
+
+for (const [label, failure] of [
+  ['read-failed', { found: false, error: 'read-failed', exchanges: [] }],
+  ['line-too-large', { found: false, error: 'line-too-large', exchanges: [] }],
+  ['not-found', { found: false, exchanges: [] }],
+  ['empty payload', null]
+]) {
+  test(`live detail retains its last good reading and retries a resolved ${label}`, async () => {
+    const initial = { found: true, exchanges: [], marker: 'initial' };
+    const recovered = { found: true, exchanges: [], marker: 'recovered' };
+    let reads = 0;
+    const { openSessionDetail, refreshOpenSessionDetail, renders, state } = sessionDetailHarness(async () => {
+      reads += 1;
+      return [initial, failure, recovered][reads - 1];
+    });
+    state.stats = { periods: { today: { sessions: { 'claude:s': { totalTokens: 100, costUsd: 1 } } } } };
+    await openSessionDetail({ client: 'claude', sessionId: 's', sessionCost: 1 });
+    const signature = state.openSession.liveSignature;
+    const paints = renders.length;
+    state.stats.periods.today.sessions['claude:s'] = { totalTokens: 200, costUsd: 2 };
+    await refreshOpenSessionDetail();
+    assert.strictEqual(state.openSession.detail, initial);
+    assert.equal(state.openSession.sessionCost, 1);
+    assert.equal(state.openSession.liveSignature, signature);
+    assert.equal(state.openSession.detailLiveBusy, false);
+    assert.equal(renders.length, paints, 'a resolved failure must not replace the visible reading');
+    await refreshOpenSessionDetail();
+    assert.equal(reads, 3, 'unchanged usage still retries the failed reading');
+    assert.strictEqual(state.openSession.detail, recovered, 'a successful empty exchange list is valid');
+    assert.equal(state.openSession.sessionCost, 2);
+    assert.notEqual(state.openSession.liveSignature, signature);
+    assert.strictEqual(renders.at(-1).detail, recovered);
+    await refreshOpenSessionDetail();
+    assert.equal(reads, 3, 'successful recovery restores idle read suppression');
+  });
+}
+
+test('live detail anchors the visible turn across growth and exchange reordering', () => {
+  const container = {
+    children: [], scrollTop: 0, clientTop: 0,
+    classList: { add() {}, remove() {} },
+    getBoundingClientRect: () => ({ top: 20 }),
+    replaceChildren() { this.children = []; this.scrollTop = 0; },
+    append(node) { this.children.push(node); }
+  };
+  function exchangeNode(row, max, expanded) {
+    const headerHeight = 40;
+    const turnHeights = expanded ? row.turnHeights : [];
+    const exchange = {
+      dataset: { startTime: String(row.startTime) },
+      classList: { contains: value => value === 'expanded' && expanded },
+      height: headerHeight + turnHeights.reduce((sum, height) => sum + height, 0)
+    };
+    function rect(offset, height) {
+      const index = container.children.indexOf(exchange);
+      const above = container.children.slice(0, index).reduce((sum, node) => sum + node.height, 0);
+      const top = 20 + above + offset - container.scrollTop;
+      return { top, bottom: top + height };
+    }
+    const header = { dataset: {}, getBoundingClientRect: () => rect(0, headerHeight) };
+    const turns = turnHeights.map((height, index) => ({
+      dataset: { key: `turn:${index}` },
+      getBoundingClientRect: () => rect(headerHeight + turnHeights.slice(0, index).reduce((sum, value) => sum + value, 0), height)
+    }));
+    exchange.getBoundingClientRect = () => rect(0, exchange.height);
+    exchange.querySelector = () => header;
+    exchange.querySelectorAll = () => turns;
+    return exchange;
+  }
+  const context = {
+    els: { breakdown: { classList: container.classList }, sessionDetail: container,
+      sessionDetailHead: { classList: container.classList, replaceChildren() {}, append() {} } },
+    state: { detailSort: 'time', openSession: {} },
+    document: { createElement: () => ({ addEventListener() {} }) },
+    t: () => '', sessionDetailBackButton: () => ({}), toggleDetailSort() {},
+    sessionRowsApi: { sessionDetailIdLabel: () => '' },
+    sessionDetailApi: { exchangeRows: detail => detail.exchanges }, exchangeNode
+  };
+  const start = rendererSource.indexOf('function renderSessionDetail(');
+  const end = rendererSource.indexOf('function sessionDetailTitle(', start);
+  vm.runInNewContext(`${rendererSource.slice(start, end)}\nglobalThis.render = renderSessionDetail;`, context);
+  const active = { startTime: 111, value: 100, turnHeights: Array(10).fill(40) };
+  const older = { startTime: 100, value: 10, turnHeights: [] };
+  container.children = [exchangeNode(active, 100, true), exchangeNode(older, 100, false)];
+  container.scrollTop = 160; // Inside turn #4 of the expanded exchange.
+
+  active.turnHeights.push(80);
+  context.render({ detail: { exchanges: [active, older] }, preserveScroll: true });
+  assert.equal(container.scrollTop, 160, 'a reply appended below the reader does not move them');
+  assert.equal(container.children[0].classList.contains('expanded'), true);
+
+  const newer = { startTime: 222, value: 200, turnHeights: [] };
+  context.render({ detail: { exchanges: [newer, active, older] }, preserveScroll: true });
+  assert.equal(container.scrollTop, 200, 'an exchange inserted above shifts only by its own height');
+
+  context.state.detailSort = 'tokens';
+  context.render({ detail: { exchanges: [active, newer, older] }, preserveScroll: true });
+  assert.equal(container.scrollTop, 160, 'a reorder preserves the same turn even with unchanged total height');
+
+  container.scrollTop = 15;
+  context.render({ detail: { exchanges: [newer, active, older] }, preserveScroll: true });
+  assert.equal(container.scrollTop, 55, 'a partially visible exchange header is also anchored');
+
+  container.scrollTop = 0;
+  context.render({ detail: { exchanges: [active, newer, older] }, preserveScroll: true });
+  assert.equal(container.scrollTop, 0, 'the top stays at the top to expose incoming activity');
 });

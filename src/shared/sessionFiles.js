@@ -191,11 +191,7 @@ function resolveSessionFile(client, sessionId, home, options = {}) {
     return findCodexSessionFiles(codexHome, [id]).get(id) || '';
   }
   if (client === 'pi') {
-    const sessionsDir = resolvePiSessionsDir({
-      env: options.env,
-      homeDir: home,
-      useEnvRoots: options.useEnvRoots
-    });
+    const sessionsDir = resolvePiSessionsDir({ homeDir: home });
     return findPiSessionFiles(sessionsDir, [id]).get(id) || '';
   }
   return '';

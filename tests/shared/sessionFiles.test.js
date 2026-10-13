@@ -230,17 +230,27 @@ test('resolves a pi session file by suffix inside its per-cwd folder', () => {
   } finally { cleanup(home); }
 });
 
-test('resolves pi sessions from PI_CODING_AGENT_DIR', () => {
+test('Pi detail keeps the scanner root despite PI_CODING_AGENT_DIR', () => {
   const home = tmpHome();
   const agentDir = path.join(home, 'relocated-pi');
   try {
-    const dir = path.join(agentDir, 'sessions', '--proj--');
+    const dir = path.join(home, '.pi', 'agent', 'sessions', '--proj--');
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, '2026-10-12T02-27-31-079Z_cfg-session.jsonl');
     fs.writeFileSync(file, '{}\n');
+    const relocated = path.join(agentDir, 'sessions', '--proj--');
+    fs.mkdirSync(relocated, { recursive: true });
+    fs.writeFileSync(path.join(relocated, path.basename(file)), '{}\n');
     assert.equal(resolveSessionFile('pi', 'cfg-session', home, {
       env: { PI_CODING_AGENT_DIR: agentDir }
     }), file);
+    assert.equal(resolveSessionFile('pi', 'cfg-session', home, {
+      env: { PI_CODING_AGENT_DIR: '~/relocated-pi' }
+    }), file);
+    fs.unlinkSync(file);
+    assert.equal(resolveSessionFile('pi', 'cfg-session', home, {
+      env: { PI_CODING_AGENT_DIR: agentDir }
+    }), '', 'an unscanned override tree must not supply a different transcript');
   } finally { cleanup(home); }
 });
 

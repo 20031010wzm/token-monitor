@@ -24,7 +24,9 @@ Pi resolves its agent directory from `PI_CODING_AGENT_DIR`, falling back to `~/.
 <agentDir>/sessions/<encoded-cwd>/<ISO-timestamp>_<sessionId>.jsonl
 ```
 
-The session id is a **suffix** of the filename, not the basename, so `findPiSessionFiles` matches `_<sessionId>.jsonl` rather than `resolveSessionFile`'s basename walk used by Claude/Codex. An explicit secondary home (a WSL distro) passes `useEnvRoots: false` so the scoped home wins over the host `PI_CODING_AGENT_DIR`.
+The session id is a **suffix** of the filename, not the basename, so `findPiSessionFiles` matches `_<sessionId>.jsonl` rather than `resolveSessionFile`'s basename walk used by Claude/Codex.
+
+The bundled Tokscale scanner uses the fixed home-relative `.pi/agent/sessions` root and does not honor `PI_CODING_AGENT_DIR`. Session Detail uses that same root, including under a scoped WSL home, so an environment override cannot redirect a listed session to a different transcript tree. Sessions stored only in an overridden Pi directory are not tracked by this integration.
 
 ## Record shape
 

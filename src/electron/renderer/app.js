@@ -4867,6 +4867,9 @@ async function refreshOpenSessionDetail() {
       client: request.client, sessionId: request.sessionId, period: request.period, sessionCost
     });
     if (state.openSession !== request) return;
+    // Readers resolve filesystem failures as payloads rather than rejecting.
+    // Keep the last good snapshot and signature so the next tick can retry.
+    if (!detail || detail.found !== true || detail.error) return;
     request.sessionCost = sessionCost;
     request.detail = detail;
     request.liveSignature = signature;
@@ -4912,12 +4915,9 @@ function renderSessionDetail({ detail, loading, error, preserveScroll = false } 
   const head = els.sessionDetailHead;       // static layer — rows scroll independently below it
   const container = els.sessionDetail;
   container.classList.remove('session-group-list');
-  // A live re-read re-inserts every row. Exchanges list newest first, so new
-  // ones land above the reading position; carry the reader down by however much
-  // the list grew instead of snapping back to the top.
-  const previousScroll = preserveScroll
-    ? { top: container.scrollTop, height: container.scrollHeight }
-    : null;
+  // Anchor the row being read: new content can grow above or below it, and
+  // token sorting can reorder exchanges without changing the total height.
+  const previousScroll = preserveScroll ? captureSessionDetailScroll(container) : null;
   // A reader who opened an exchange keeps it open; a rebuild that collapsed it
   // would look like the page had reset itself under them.
   const expandedStarts = preserveScroll
@@ -4954,8 +4954,36 @@ function renderSessionDetail({ detail, loading, error, preserveScroll = false } 
 
   const max = Math.max(1, ...rows.map((row) => row.value));
   for (const row of rows) container.append(exchangeNode(row, max, expandedStarts?.has(String(row.startTime)) === true));
-  if (previousScroll && previousScroll.top > 0) {
-    container.scrollTop = previousScroll.top + Math.max(0, container.scrollHeight - previousScroll.height);
+  if (previousScroll) restoreSessionDetailScroll(container, previousScroll);
+}
+
+function captureSessionDetailScroll(container) {
+  const top = container.scrollTop;
+  if (top === 0) return { top };
+  const viewportTop = container.getBoundingClientRect().top + container.clientTop;
+  for (const exchange of container.children) {
+    if (!exchange.dataset.startTime || exchange.getBoundingClientRect().bottom <= viewportTop) continue;
+    const candidates = [exchange.querySelector('.detail-ex-head')];
+    if (exchange.classList.contains('expanded')) candidates.push(...exchange.querySelectorAll('.detail-turn'));
+    const node = candidates.find(candidate => candidate && candidate.getBoundingClientRect().bottom > viewportTop);
+    if (node) return {
+      top, startTime: exchange.dataset.startTime, turnKey: node.dataset.key,
+      offset: node.getBoundingClientRect().top - viewportTop
+    };
+  }
+  return { top };
+}
+
+function restoreSessionDetailScroll(container, anchor) {
+  const exchange = [...container.children].find(node => node.dataset.startTime === anchor.startTime);
+  const node = exchange && (anchor.turnKey
+    ? [...exchange.querySelectorAll('.detail-turn')].find(turn => turn.dataset.key === anchor.turnKey)
+    : exchange.querySelector('.detail-ex-head'));
+  if (node && anchor.top > 0) {
+    const viewportTop = container.getBoundingClientRect().top + container.clientTop;
+    container.scrollTop += node.getBoundingClientRect().top - viewportTop - anchor.offset;
+  } else {
+    container.scrollTop = anchor.top;
   }
 }
 
@@ -5221,6 +5249,7 @@ function exchangeNode(row, max, expanded = false) {
 function turnNode(turn) {
   const el = document.createElement('div');
   el.className = 'detail-turn';
+  el.dataset.key = turn.key;
   const tk = turn.tokens || {};
   // "cache" folds cache reads + cache writes (Claude's cache_creation) into one bucket so the
   // in/out/cache breakdown sums to the turn total; reason is an informational subset of out.

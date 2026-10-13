@@ -2,19 +2,12 @@
 
 const path = require('node:path');
 
-function nonBlank(value) {
-  const text = String(value ?? '').trim();
-  return text || '';
-}
-
-// Pi (pi.dev) resolves its agent directory from PI_CODING_AGENT_DIR, falling
-// back to ~/.pi/agent, and writes one JSONL transcript per session under
-// `<agentDir>/sessions/<encoded-cwd>/<ISO-timestamp>_<sessionId>.jsonl`.
-// `useEnvRoots: false` is used for an explicit secondary home such as a WSL
-// distro, where the scoped home must win over the host process environment.
-function resolvePiAgentDir({ env, homeDir = '', useEnvRoots = true } = {}) {
-  const configured = useEnvRoots ? nonBlank((env || process.env).PI_CODING_AGENT_DIR) : '';
-  return configured ? path.resolve(configured) : path.join(homeDir, '.pi', 'agent');
+// Match the bundled scanner's home-relative Pi root. Pi itself accepts
+// PI_CODING_AGENT_DIR, but Tokscale does not, so applying it only to detail
+// lookup would hide sessions that the scan still reports. The supplied home
+// also scopes Windows lookups to the selected WSL distro.
+function resolvePiAgentDir({ homeDir = '' } = {}) {
+  return path.join(homeDir, '.pi', 'agent');
 }
 
 function resolvePiSessionsDir(options = {}) {
