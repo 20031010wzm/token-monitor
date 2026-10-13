@@ -59,7 +59,13 @@
     const now = options.now || new Date();
     const sortBy = options.sortBy === 'tokens' ? 'tokens' : 'time';
     const exchanges = (detail && detail.exchanges) || [];
-    const rows = exchanges.map((ex, i) => {
+    const occurrences = new Map();
+    const rows = exchanges.map((ex) => {
+      // Appending replies or changing display order must not change identity.
+      // Disambiguate repeated prompts in transcript order, including missing times.
+      const identity = JSON.stringify([ex.startedAt || '', ex.promptPreview || '']);
+      const occurrence = occurrences.get(identity) || 0;
+      occurrences.set(identity, occurrence + 1);
       const turnCount = finiteNumber(ex.turnCount);
       const toolCount = (ex.tools || []).length;
       const subtitleParts = [
@@ -68,7 +74,7 @@
         toolCount > 0 ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : ''
       ].filter(Boolean);
       return {
-        key: `exchange:${i}`,
+        key: `exchange:${identity}:${occurrence}`,
         isPrompt: Boolean(ex.promptPreview),
         title: ex.promptPreview ? ex.promptPreview : '(session start)',
         subtitle: subtitleParts.join(' · '),

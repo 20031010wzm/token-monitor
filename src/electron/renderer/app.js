@@ -2146,6 +2146,9 @@ const overflowText = window.TokenMonitorOverflowText.create({
   onLeave: () => requestAnimationFrame(() => {
     if (homeSessionRenderPending && state.breakdown === 'home'
       && visibleStatsSurface() === 'main' && state.stats) renderHome();
+    // A final stats update may have been held before reading or before painting.
+    // Reuse the refresh guards to catch up without waiting for another push.
+    if (state.openSession?.kind === 'session') void refreshOpenSessionDetail();
   })
 });
 
@@ -4170,7 +4173,7 @@ function limitDetailTooltipShouldHoldRender() {
 }
 
 function sessionTooltipShouldHoldRender() {
-  return Boolean(document.querySelector('.home-session-row .is-hover-reading, .home-session-meta .limit-detail-tooltip-wrap:hover, .home-session-meta .limit-detail-tooltip-wrap:focus-within, .row-context.limit-detail-tooltip-wrap:hover, .row-context.limit-detail-tooltip-wrap:focus-within, .row-label .limit-detail-tooltip-wrap:hover, .row-label .limit-detail-tooltip-wrap:focus-within, .session-group-run .is-hover-reading, .session-group-run:focus-within, .session-group-run .limit-detail-tooltip-wrap:hover, .session-group-run .limit-detail-tooltip-wrap:focus-within, .detail-ex-title.limit-detail-tooltip-wrap:hover, .detail-ex-title.limit-detail-tooltip-wrap:focus-within'));
+  return Boolean(document.querySelector('.home-session-row .is-hover-reading, .home-session-meta .limit-detail-tooltip-wrap:hover, .home-session-meta .limit-detail-tooltip-wrap:focus-within, .row-context.limit-detail-tooltip-wrap:hover, .row-context.limit-detail-tooltip-wrap:focus-within, .row-label .limit-detail-tooltip-wrap:hover, .row-label .limit-detail-tooltip-wrap:focus-within, .session-group-run .is-hover-reading, .session-group-run:focus-within, .session-group-run .limit-detail-tooltip-wrap:hover, .session-group-run .limit-detail-tooltip-wrap:focus-within, .detail-ex-title.is-hover-reading, .detail-heading.is-hover-reading, .detail-ex-title.limit-detail-tooltip-wrap:hover, .detail-ex-title.limit-detail-tooltip-wrap:focus-within'));
 }
 
 function flushPendingLimitDetailTooltipRender() {
@@ -4851,17 +4854,17 @@ async function refreshOpenSessionDetail() {
   const request = state.openSession;
   if (request?.kind !== 'session' || !request.detail || request.detailLiveBusy) return;
   if (visibleStatsSurface() !== 'main' || sessionTooltipShouldHoldRender()) return;
-  // A read that finished under a held tooltip is painted here instead of being
-  // dropped, so the page still catches up without reading the transcript again.
+  // Paint a held result once, then check whether usage advanced during its read.
+  // An unchanged signature still avoids another transcript read.
   if (request.detailRenderPending) {
     request.detailRenderPending = false;
     renderSessionDetail({ detail: request.detail, preserveScroll: true });
-    return;
   }
   const signature = sessionDetailLiveSignature();
   if (!signature || signature === request.liveSignature) return;
   const sessionCost = sessionLiveCost(sessionLiveStatsEntry(request), request.client);
   request.detailLiveBusy = true;
+  let readSucceeded = false;
   try {
     const detail = await window.tokenMonitor.getSessionDetail({
       client: request.client, sessionId: request.sessionId, period: request.period, sessionCost
@@ -4873,6 +4876,7 @@ async function refreshOpenSessionDetail() {
     request.sessionCost = sessionCost;
     request.detail = detail;
     request.liveSignature = signature;
+    readSucceeded = true;
     // The reader can start a hover while the read is in flight, so the hold is
     // rechecked here rather than trusted from the call site.
     if (sessionTooltipShouldHoldRender()) { request.detailRenderPending = true; return; }
@@ -4881,6 +4885,10 @@ async function refreshOpenSessionDetail() {
     // Keep the last good reading; the next stats tick tries again.
   } finally {
     request.detailLiveBusy = false;
+    // Leave can run while busy. A successful read checks for a final push via
+    // the same visibility/hold/signature guards; failures wait for a later retry.
+    if (readSucceeded && state.openSession === request
+      && sessionDetailLiveSignature() !== request.liveSignature) void refreshOpenSessionDetail();
   }
 }
 
@@ -4920,10 +4928,10 @@ function renderSessionDetail({ detail, loading, error, preserveScroll = false } 
   const previousScroll = preserveScroll ? captureSessionDetailScroll(container) : null;
   // A reader who opened an exchange keeps it open; a rebuild that collapsed it
   // would look like the page had reset itself under them.
-  const expandedStarts = preserveScroll
+  const expandedKeys = preserveScroll
     ? new Set([...container.children]
       .filter((node) => node.classList.contains('expanded'))
-      .map((node) => node.dataset.startTime))
+      .map((node) => node.dataset.exchangeKey))
     : null;
   head.replaceChildren();
   container.replaceChildren();
@@ -4953,7 +4961,7 @@ function renderSessionDetail({ detail, loading, error, preserveScroll = false } 
   head.append(sort);
 
   const max = Math.max(1, ...rows.map((row) => row.value));
-  for (const row of rows) container.append(exchangeNode(row, max, expandedStarts?.has(String(row.startTime)) === true));
+  for (const row of rows) container.append(exchangeNode(row, max, expandedKeys?.has(row.key) === true));
   if (previousScroll) restoreSessionDetailScroll(container, previousScroll);
 }
 
@@ -4962,12 +4970,12 @@ function captureSessionDetailScroll(container) {
   if (top === 0) return { top };
   const viewportTop = container.getBoundingClientRect().top + container.clientTop;
   for (const exchange of container.children) {
-    if (!exchange.dataset.startTime || exchange.getBoundingClientRect().bottom <= viewportTop) continue;
+    if (!exchange.dataset.exchangeKey || exchange.getBoundingClientRect().bottom <= viewportTop) continue;
     const candidates = [exchange.querySelector('.detail-ex-head')];
     if (exchange.classList.contains('expanded')) candidates.push(...exchange.querySelectorAll('.detail-turn'));
     const node = candidates.find(candidate => candidate && candidate.getBoundingClientRect().bottom > viewportTop);
     if (node) return {
-      top, startTime: exchange.dataset.startTime, turnKey: node.dataset.key,
+      top, exchangeKey: exchange.dataset.exchangeKey, turnKey: node.dataset.key,
       offset: node.getBoundingClientRect().top - viewportTop
     };
   }
@@ -4975,7 +4983,7 @@ function captureSessionDetailScroll(container) {
 }
 
 function restoreSessionDetailScroll(container, anchor) {
-  const exchange = [...container.children].find(node => node.dataset.startTime === anchor.startTime);
+  const exchange = [...container.children].find(node => node.dataset.exchangeKey === anchor.exchangeKey);
   const node = exchange && (anchor.turnKey
     ? [...exchange.querySelectorAll('.detail-turn')].find(turn => turn.dataset.key === anchor.turnKey)
     : exchange.querySelector('.detail-ex-head'));
@@ -5230,10 +5238,9 @@ function exchangeNode(row, max, expanded = false) {
   const turnsEl = wrap.querySelector('.detail-turns');
   for (const turn of row.turns) turnsEl.append(turnNode(turn));
 
-  // The open/closed choice is DOM state, so a live re-read has to be told which
-  // exchange to reopen. `startTime` is the stable identity a row carries; its key
-  // is a positional index that shifts every time a new turn arrives.
-  wrap.dataset.startTime = String(row.startTime);
+  // Row keys are assigned in transcript order before display sorting, so
+  // equal or missing timestamps do not reopen or anchor a different exchange.
+  wrap.dataset.exchangeKey = row.key;
   const setExpanded = (open) => {
     turnsEl.classList.toggle('hidden', !open);
     wrap.classList.toggle('expanded', open);
