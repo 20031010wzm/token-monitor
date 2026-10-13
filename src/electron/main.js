@@ -23,6 +23,7 @@ const { exportFileSet, exportSignature, EXPORT_FILENAMES } = require('../shared/
 const { createDefaultTrayLayout, normalizeTrayLayout } = require('../shared/trayLayout');
 const fontSettingsApi = require('../shared/fontSettings');
 const motionPreferenceApi = require('./motionPreference');
+const tokenNumberAnimationApi = require('./tokenNumberAnimation');
 const { clearBackgroundImage, getBackgroundImage, importBackgroundImage } = require('./backgroundImage');
 const { createClientSourceIpcHandlers } = require('./clientSourceIpc');
 const { createClaudeWebFetch } = require('./providers/claude/webFetch');
@@ -202,6 +203,7 @@ const {
 } = require('../shared/appUpdater');
 const cursorAuth = require('../shared/providers/cursor/auth');
 const cursorProbe = require('../shared/providers/cursor/probe');
+const { stepfunToken } = require('../shared/providers/stepfun/limits');
 const opencodeWeb = require('../shared/providers/opencode/web');
 const opencodeGoApi = require('../shared/providers/opencode/goApi');
 const opencodeProfiles = require('../shared/providers/opencode/profiles');
@@ -572,6 +574,7 @@ function defaultSettings() {
     windowsBackdrop: 'acrylic',
     macBackdrop: 'vibrancy',
     reduceMotion: 'system',
+    tokenNumberAnimation: 'roll',
     showLiveDot: true,
     showToolIcons: true,
     titleIconOnly: true,
@@ -861,6 +864,25 @@ function persistClaudeWebCookieRenewal({ previousCookie, cookie } = {}) {
   return true;
 }
 
+// The StepFun Oasis token's access half expires every 30 minutes; the limits
+// fetcher rotates it through the platform's own RefreshToken endpoint. The
+// rotated pair lands here and is stored only while the setting still holds the
+// token that was refreshed, so a fresh paste landing mid-flight always wins.
+// Values are compared in the fetcher's normalized form (a pasted raw cookie
+// header and its bare token compare equal), and the stored value is normalized
+// on the way in.
+function persistStepfunTokenRenewal({ previousToken, token } = {}) {
+  if (!settings?.stepfunToken) return false;
+  const expected = stepfunToken({}, { stepfunToken: previousToken });
+  const renewed = stepfunToken({}, { stepfunToken: token });
+  if (!expected || !renewed) return false;
+  if (stepfunToken({}, { stepfunToken: settings.stepfunToken }) !== expected) return false;
+  if (settings.stepfunToken === renewed) return true;
+  settings.stepfunToken = renewed;
+  saveSettings({ throwOnError: true });
+  return true;
+}
+
 // A save-time probe gets the collector's transports but none of its write-backs:
 // a credential that has not been saved yet must not renew itself into
 // settings, so a rotation is reported into `renewed` and stored with the rest
@@ -873,6 +895,10 @@ function credentialProbeDeps(renewed = {}) {
     claudeWebFetch: electronClaudeWebFetch,
     onClaudeWebCookieRenewed: ({ cookie }) => {
       renewed.claudeWebCookie = cookie;
+      return true;
+    },
+    onStepfunTokenRenewed: ({ token }) => {
+      renewed.stepfunToken = token;
       return true;
     },
     providerRuntimeState: new Map(),
@@ -896,6 +922,7 @@ function electronLimitsDeps() {
     },
     resolveConfigSnapshot: () => electronLimitsConfig(),
     onClaudeWebCookieRenewed: persistClaudeWebCookieRenewal,
+    onStepfunTokenRenewed: persistStepfunTokenRenewal,
     onAntigravityCredentialsRenewed: persistAntigravityCredentialsRenewal,
     onThirdPartyCredentialsRenewed: persistThirdPartyCredentialsRenewal,
     onThirdPartyAccountKeyResolved: persistThirdPartyAccountKey
@@ -2564,6 +2591,7 @@ function readSettings() {
     merged.sessionTitlesEnabled = parseBoolean(merged.sessionTitlesEnabled, true);
     merged.sessionContextMetric = normalizeSessionContextMetric(merged.sessionContextMetric);
     merged.reduceMotion = motionPreferenceApi.normalize(merged.reduceMotion);
+    merged.tokenNumberAnimation = tokenNumberAnimationApi.normalize(merged.tokenNumberAnimation);
     merged.showLiveTokenRate = parseBoolean(merged.showLiveTokenRate, false);
     merged.liveTokenRateScope = normalizeLiveTokenRateScope(merged.liveTokenRateScope);
     merged.compactTokenUnits = normalizeCompactTokenUnits(merged.compactTokenUnits);
@@ -7559,6 +7587,7 @@ app.whenReady().then(() => {
       windowsBackdrop: normalizeWindowsBackdropMode(patch.windowsBackdrop ?? settings.windowsBackdrop),
       macBackdrop: normalizeMacBackdropMode(patch.macBackdrop ?? settings.macBackdrop),
       reduceMotion: motionPreferenceApi.normalize(patch.reduceMotion ?? settings.reduceMotion),
+      tokenNumberAnimation: tokenNumberAnimationApi.normalize(patch.tokenNumberAnimation ?? settings.tokenNumberAnimation),
       showLiveDot: patch.showLiveDot ?? settings.showLiveDot ?? true,
       showToolIcons: patch.showToolIcons ?? settings.showToolIcons ?? true,
       titleIconOnly: parseBoolean(patch.titleIconOnly ?? settings.titleIconOnly, false),
