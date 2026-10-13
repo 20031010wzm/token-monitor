@@ -593,6 +593,55 @@ test('Reasonix rows enter the shared detail navigation path instead of a native 
   assert.doesNotMatch(rendererSource, /nativeSessionBreakdown/);
 });
 
+for (const scenario of ['catch-up', 'hover', 'unchanged', 'hidden', 'closed', 'replaced', 'initial failure', 'initial rejection', 'catch-up failure', 'catch-up rejection']) {
+  test(`first detail IPC catches the final stats push without another tick: ${scenario}`, async () => {
+    const initialRead = deferred();
+    let reads = 0;
+    const { openSessionDetail, refreshOpenSessionDetail, context, renders, state } = sessionDetailHarness(async () => {
+      reads += 1;
+      if (reads === 1) return initialRead.promise;
+      if (scenario === 'catch-up rejection') throw new Error('read failed');
+      if (scenario === 'catch-up failure') return { found: false, error: 'read-failed' };
+      return { found: true, marker: 200 };
+    });
+    const sessions = { 'claude:s': { totalTokens: 100, costUsd: 1 } };
+    state.stats = { periods: { today: { sessions } } };
+    const opening = openSessionDetail({ client: 'claude', sessionId: 's', sessionCost: 1 });
+    const request = state.openSession;
+    if (scenario !== 'unchanged') sessions['claude:s'] = { totalTokens: 200, costUsd: 2 };
+    // The only external refresh occurs while initial detail is still null.
+    await refreshOpenSessionDetail();
+    assert.equal(reads, 1);
+    if (scenario === 'hover') context.sessionTooltipShouldHoldRender = () => true;
+    if (scenario === 'hidden') context.visibleStatsSurface = () => 'other';
+    if (scenario === 'closed') state.openSession = null;
+    if (scenario === 'replaced') state.openSession = { kind: 'session', detail: null };
+    if (scenario === 'initial rejection') initialRead.reject(new Error('read failed'));
+    else initialRead.resolve(scenario === 'initial failure' ? { found: false, error: 'read-failed' } : { found: true, marker: 100 });
+    await opening;
+    await new Promise(resolve => setImmediate(resolve));
+    const shouldCatchUp = ['catch-up', 'catch-up failure', 'catch-up rejection'].includes(scenario);
+    assert.equal(reads, shouldCatchUp ? 2 : 1);
+    if (shouldCatchUp) {
+      const succeeded = scenario === 'catch-up';
+      assert.equal(request.detail.marker, succeeded ? 200 : 100);
+      assert.equal(request.liveSignature, JSON.stringify(succeeded ? [200, 2, 0] : [100, 1, 0]));
+      assert.equal(request.detailLiveBusy, false);
+      assert.equal(renders.at(-1).detail.marker, succeeded ? 200 : 100);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(reads, 2, 'a failed catch-up does not spin');
+    }
+    if (scenario === 'closed' || scenario === 'replaced') assert.equal(renders.length, 1, 'stale initial reads cannot paint');
+    if (scenario === 'hover' || scenario === 'hidden') {
+      context.sessionTooltipShouldHoldRender = () => false;
+      context.visibleStatsSurface = () => 'main';
+      await refreshOpenSessionDetail(); // Existing leave/visibility catch-up, not a stats tick.
+      assert.equal(reads, 2);
+      assert.equal(request.detail.marker, 200);
+    }
+  });
+}
+
 test('an open session detail re-reads only when its usage moved, and never mid-hover', async () => {
   const requests = [];
   const pending = [];
@@ -611,13 +660,12 @@ test('an open session detail re-reads only when its usage moved, and never mid-h
   holdRead = true;
   const opening = openSessionDetail({ client: 'claude', sessionId: 's', sessionCost: 0.5, title: 'Session' });
   state.stats.periods.today.sessions['claude:s'] = { client: 'claude', totalTokens: 150, costUsd: 0.75 };
+  holdRead = false;
   pending[0].resolve({ found: true, marker: 1 });
   await opening;
-  assert.equal(requests.length, 1);
-  holdRead = false;
+  await new Promise(resolve => setImmediate(resolve));
 
-  // The push is re-read on the next tick, priced from the live row.
-  await refreshOpenSessionDetail();
+  // The push is re-read without another tick, priced from the live row.
   assert.equal(requests.length, 2, 'a push that landed mid-flight is re-read');
   assert.equal(requests[1].sessionCost, 0.75);
   assert.equal(state.openSession.detail.marker, 2);

@@ -385,11 +385,9 @@ function parseCodebuddyTranscriptLines(lines) {
   return events;
 }
 
-// Pi (pi.dev) writes one JSONL entry per message. Only `message` entries carry
-// conversation: a user message is always a real prompt boundary (tool output
-// arrives as a separate `toolResult` role and compaction summaries are their own
-// `compaction` entry), and each assistant message is one API response with its
-// own usage, so nothing has to be de-duplicated across content blocks. Pi
+// Pi (pi.dev) writes conversation and billed operations as separate entries.
+// Only user messages create prompt boundaries; summary, tool and standalone
+// usage contributes to totals without counting as assistant replies. Pi
 // follows OpenAI's convention: `totalTokens` is input + output + cacheRead +
 // cacheWrite, and `reasoning` is an informational subset of output.
 function piPromptText(content) {
@@ -414,16 +412,31 @@ function parsePiTranscriptLines(lines) {
     if (!trimmed) continue;
     let obj;
     try { obj = JSON.parse(trimmed); } catch (_) { continue; }
-    if (obj.type !== 'message') continue;
-    const message = obj.message || {};
+    const message = obj.type === 'message' ? obj.message || {} : {};
     const timestamp = obj.timestamp || '';
-    if (message.role === 'assistant' && message.usage) {
-      const u = message.usage;
-      const tools = Array.isArray(message.content)
+    if (message.role === 'user') {
+      const text = piPromptText(message.content);
+      if (text) events.push({ kind: 'prompt', timestamp, text });
+      continue;
+    }
+    let type;
+    let u;
+    if (message.role === 'assistant' || message.role === 'toolResult') {
+      u = message.usage;
+      if (message.role === 'toolResult') type = 'tool-usage';
+    } else if (obj.type === 'compaction' || obj.type === 'branch_summary' || obj.type === 'usage') {
+      u = obj.usage;
+      type = obj.type === 'compaction' ? 'compaction-summary'
+        : obj.type === 'branch_summary' ? 'branch-summary'
+          : obj.kind === 'cache_warm' ? 'cache-warm' : 'usage';
+    }
+    if (u) {
+      const tools = message.role === 'assistant' && Array.isArray(message.content)
         ? message.content.filter((part) => part && part.type === 'toolCall').map((part) => part.name)
         : [];
       events.push({
         kind: 'turn',
+        ...(type ? { type } : {}),
         timestamp,
         tokens: makeTokens({
           input: u.input,
@@ -432,14 +445,11 @@ function parsePiTranscriptLines(lines) {
           cacheWrite: u.cacheWrite,
           reasoning: u.reasoning
         }),
-        // Pi prices each reply itself; `readSessionDetail` prefers this over the
+        // Pi prices each operation itself; `readSessionDetail` prefers this over the
         // proportional split of the session subtotal.
         cost: num(u.cost && u.cost.total),
         tools: uniqueTools(tools)
       });
-    } else if (message.role === 'user') {
-      const text = piPromptText(message.content);
-      if (text) events.push({ kind: 'prompt', timestamp, text });
     }
   }
   return events;
@@ -478,7 +488,9 @@ function finalizeExchange(ex) {
   // Paid non-reply usage such as a DSH compaction summary or failed/retried
   // assistant attempt stays in `turns` for period filtering, token totals and
   // cost allocation, but must not inflate the user-facing conversation count.
-  ex.turnCount = ex.turns.filter((turn) => turn.type !== 'compaction-summary' && turn.type !== 'assistant-attempt').length;
+  ex.turnCount = ex.turns.filter((turn) => ![
+    'compaction-summary', 'assistant-attempt', 'branch-summary', 'tool-usage', 'cache-warm', 'usage'
+  ].includes(turn.type)).length;
   ex.tools = uniqueTools(ex.turns.flatMap((t) => t.tools));
   ex.tokensAvailable = ex.turns.every((turn) => turn.tokensAvailable !== false);
   const unpriced = ex.turns.reduce((sum, turn) => sum + num(turn.unpricedTokens), 0);

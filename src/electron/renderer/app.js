@@ -4806,7 +4806,7 @@ async function openSessionDetail({ client, sessionId, sessionCost, title, return
   state.openSession = request;
   renderSessionDetail({ loading: true });
   // Read before the request, not after: a stats push that lands while it is in
-  // flight has to stay unseen so the next tick re-reads, instead of being written
+  // flight has to stay unseen so catch-up re-reads, instead of being written
   // off against a response that predates it.
   const liveSignature = sessionDetailLiveSignature();
   try {
@@ -4815,6 +4815,9 @@ async function openSessionDetail({ client, sessionId, sessionCost, title, return
       request.detail = detail;
       request.liveSignature = liveSignature;
       applySessionDetailResult(request, { detail });
+      // The final push may have arrived while detail was still null. Use the
+      // existing guards now; a held/hidden page catches up on leave/visibility.
+      if (detail?.found === true && !detail.error) void refreshOpenSessionDetail();
     }
   } catch (_) {
     applySessionDetailResult(request, { error: true });

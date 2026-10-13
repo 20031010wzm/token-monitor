@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { parsePiTranscript, readSessionDetail } = require('../../src/shared/sessionDetail');
+const { exchangeRows } = require('../../src/electron/renderer/sessionDetail');
 
 function tmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tm-pi-home-'));
@@ -32,6 +33,88 @@ function assistant(usage, content = [], timestamp = '2026-10-12T02:28:43.068Z') 
 function user(text, timestamp = '2026-10-12T02:28:41.508Z') {
   return JSON.stringify({ type: 'message', id: 'm0', parentId: null, timestamp, message: { role: 'user', content: [{ type: 'text', text }] } });
 }
+
+function extraUsage(type, usage, timestamp, fields = {}) {
+  return JSON.stringify({ type, timestamp, ...fields, usage });
+}
+
+test('Pi counts all billed operations without counting them as assistant replies', () => {
+  const home = tmpHome();
+  const at = '2026-10-12T02:28:44.000Z';
+  try {
+    writePiSession(home, 'mixed-usage', [
+      user('mixed usage'),
+      assistant({ input: 100, output: 20, cost: { total: 0.012 } }),
+      extraUsage('compaction', { input: 40, output: 10, cost: { total: 0.004 } }, at, { tokensBefore: 90000 }),
+      extraUsage('branch_summary', { input: 30, output: 5, cost: { total: 0.003 } }, at),
+      extraUsage('usage', { cacheRead: 40, cacheWrite: 10, cost: { total: 0.001 } }, at, { kind: 'cache_warm' }),
+      JSON.stringify({ type: 'message', timestamp: at, message: { role: 'toolResult', usage: { input: 10, output: 1, cost: { total: 0.002 } } } }),
+      extraUsage('compaction', undefined, at, { tokensBefore: 80000, summary: 'old summary' }),
+      extraUsage('branch_summary', undefined, at, { summary: 'old branch' }),
+      extraUsage('model_change', { input: 999 }, at)
+    ]);
+    const detail = readSessionDetail({ client: 'pi', sessionId: 'mixed-usage', sessionCost: 99, home });
+    assert.equal(detail.totals.totalTokens, 266);
+    assert.ok(Math.abs(detail.totals.costUsd - 0.022) < 1e-9);
+    assert.equal(detail.totals.turnCount, 1);
+    assert.equal(detail.exchanges.length, 1);
+    assert.equal(detail.exchanges[0].turns.length, 5);
+    assert.deepEqual(detail.exchanges[0].tokens, { input: 180, output: 36, cacheRead: 40, cacheWrite: 10, reasoning: 0, total: 266 });
+    assert.ok(Math.abs(detail.exchanges[0].costEstimate - 0.022) < 1e-9);
+    assert.deepEqual(exchangeRows(detail)[0].turns.map(turn => turn.label), [
+      'Reply #1', 'Compaction summary', 'Branch summary', 'Cache warming', 'Tool usage'
+    ]);
+  } finally { cleanup(home); }
+});
+
+test('Pi filters operation usage by its own date and keeps reply numbering', () => {
+  const home = tmpHome();
+  const now = new Date(2026, 9, 12, 12);
+  const at = day => new Date(2026, 9, day, 1).toISOString();
+  try {
+    writePiSession(home, 'period-usage', [
+      user('across dates', at(11)),
+      assistant({ input: 100, cost: { total: 0.01 } }, [], at(11)),
+      extraUsage('compaction', { input: 40, output: 10, reasoning: 5, cost: { total: 0.004 } }, at(12)),
+      extraUsage('branch_summary', { input: 30, output: 5, cost: { total: 0.003 } }, at(12)),
+      extraUsage('usage', { cacheRead: 40, cacheWrite: 10, cost: { total: 0.001 } }, at(12), { kind: 'cache_warm' }),
+      JSON.stringify({ type: 'message', timestamp: at(12), message: { role: 'toolResult', usage: { input: 10, output: 1, cost: { total: 0.002 } } } }),
+      extraUsage('usage', { input: 4, cost: { total: 0.002 } }, at(12), { kind: 'future_operation' }),
+      assistant({ output: 20, cost: { total: 0.02 } }, [], at(1)),
+      extraUsage('usage', { input: 999, cost: { total: 9 } }, new Date(2026, 8, 30, 1).toISOString())
+    ]);
+    const read = period => readSessionDetail({ client: 'pi', sessionId: 'period-usage', period, sessionCost: 99, home, deps: { now: () => now } });
+    const today = read('today');
+    assert.equal(today.totals.totalTokens, 150);
+    assert.ok(Math.abs(today.totals.costUsd - 0.012) < 1e-9);
+    assert.equal(today.totals.turnCount, 0);
+    assert.equal(today.exchanges[0].tokens.reasoning, 5, 'reasoning is informational, not added again');
+    assert.equal(exchangeRows(today)[0].turns.at(-1).label, 'Usage');
+    const month = read('month');
+    assert.equal(month.totals.totalTokens, 270);
+    assert.ok(Math.abs(month.totals.costUsd - 0.042) < 1e-9);
+    assert.equal(month.totals.turnCount, 2);
+    assert.equal(exchangeRows(month)[0].turns.at(-1).label, 'Reply #2');
+    assert.equal(read('total').totals.totalTokens, 1269);
+    assert.ok(Math.abs(read('total').totals.costUsd - 9.042) < 1e-9);
+  } finally { cleanup(home); }
+});
+
+test('Pi operation-only usage before a prompt retains the unpriced cost fallback', () => {
+  const home = tmpHome();
+  try {
+    writePiSession(home, 'unpriced-operations', [
+      extraUsage('compaction', { input: 20, cost: { total: 0 } }, '2026-10-12T02:28:43.000Z'),
+      extraUsage('usage', { cacheRead: 40 }, '2026-10-12T02:28:44.000Z', { kind: 'cache_warm' })
+    ]);
+    const detail = readSessionDetail({ client: 'pi', sessionId: 'unpriced-operations', sessionCost: 6, home });
+    assert.equal(detail.totals.totalTokens, 60);
+    assert.equal(detail.totals.turnCount, 0);
+    assert.equal(detail.totals.costUsd, 6);
+    assert.equal(detail.exchanges[0].promptPreview, '');
+    assert.deepEqual(detail.exchanges[0].turns.map(turn => turn.costEstimate), [2, 4]);
+  } finally { cleanup(home); }
+});
 
 test('parsePiTranscript yields prompts and turns with exact tokens, tools and cost', () => {
   const lines = [

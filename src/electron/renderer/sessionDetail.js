@@ -5,6 +5,15 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.TokenMonitorSessionDetail = api;
 })(typeof window !== 'undefined' ? window : null, function createSessionDetailApi() {
+  const nonReplyLabels = {
+    'compaction-summary': 'Compaction summary',
+    'assistant-attempt': 'Model attempt',
+    'branch-summary': 'Branch summary',
+    'tool-usage': 'Tool usage',
+    'cache-warm': 'Cache warming',
+    usage: 'Usage'
+  };
+
   function finiteNumber(value) {
     const n = Number(value);
     return Number.isFinite(n) ? n : 0;
@@ -27,11 +36,9 @@
   }
 
   function turnRow(turn, index, replyIndex) {
-    const isCompactionSummary = turn.type === 'compaction-summary';
-    const isAssistantAttempt = turn.type === 'assistant-attempt';
     return {
       key: `turn:${index}`,
-      label: isCompactionSummary ? 'Compaction summary' : (isAssistantAttempt ? 'Model attempt' : `Reply #${replyIndex + 1}`),
+      label: Object.hasOwn(nonReplyLabels, turn.type) ? nonReplyLabels[turn.type] : `Reply #${replyIndex + 1}`,
       value: finiteNumber(turn.tokens && turn.tokens.total),
       tokensAvailable: turn.tokensAvailable !== false,
       cost: finiteNumber(turn.costEstimate),
@@ -45,7 +52,7 @@
     let replyIndex = 0;
     return (turns || []).map((turn, index) => {
       const row = turnRow(turn, index, replyIndex);
-      if (turn.type !== 'compaction-summary' && turn.type !== 'assistant-attempt') replyIndex += 1;
+      if (!Object.hasOwn(nonReplyLabels, turn.type)) replyIndex += 1;
       return row;
     });
   }
